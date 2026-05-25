@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# uv / venv
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# dotenv
+.env
+.env.*
+!env.dev
+!env.staging
+!env.production
+
+# Data (bsllmner-mk2 raw + ETL output parquet)
+data/
+
+# Notebook checkpoints / Quarto
+.ipynb_checkpoints/
+_site/
+.quarto/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log

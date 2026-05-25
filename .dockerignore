@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# Whitelist what the image needs at build time
+!.python-version
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!tests/
+!docs/
+!scripts/
+!notebooks/

@@ -1,0 +1,34 @@
+services:
+  app:
+    container_name: ${BSLLMNER_VIEWER_PREFIX}-app
+    image: ${BSLLMNER_VIEWER_PREFIX}-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app:rw
+      - app-venv:/app/.venv:rw
+    ports:
+      - "${BSLLMNER_VIEWER_APP_PORT}:${BSLLMNER_VIEWER_APP_INTERNAL_PORT}"
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+      - BSLLMNER_VIEWER_ENV=${BSLLMNER_VIEWER_ENV}
+      - BSLLMNER_VIEWER_APP_INTERNAL_PORT=${BSLLMNER_VIEWER_APP_INTERNAL_PORT}
+      - BSLLMNER_VIEWER_LOG_LEVEL=${BSLLMNER_VIEWER_LOG_LEVEL:-info}
+      - BSLLMNER_VIEWER_DATA_DIR=${BSLLMNER_VIEWER_DATA_DIR:-/app/data}
+      # uv runtime tuning (固定値、env file で上書き不可)
+      - UV_PROJECT_ENVIRONMENT=/app/.venv
+      - UV_LINK_MODE=copy
+      - UV_COMPILE_BYTECODE=1
+    working_dir: /app
+    command: ${BSLLMNER_VIEWER_APP_COMMAND}
+    init: true
+    networks: [default-network]
+
+volumes:
+  app-venv:
+    name: ${BSLLMNER_VIEWER_PREFIX}-venv
+
+networks:
+  default-network:
+    name: ${BSLLMNER_VIEWER_PREFIX}-network

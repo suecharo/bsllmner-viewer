@@ -1,0 +1,64 @@
+[project]
+name = "bsllmner-viewer"
+version = "0.0.0"
+description = "Viewer for bsllmner-mk2 BioSample x ontology mapping results (Streamlit + DuckDB)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Hirotaka Suetake", email = "suecharo@sator.co.jp" },
+]
+dependencies = [
+    "duckdb>=1.1.0",
+    "pandas>=2.2.0",
+    "plotly>=5.24.0",
+    "pyarrow>=17.0.0",
+    "pydantic>=2.9.0",
+    "streamlit>=1.39.0",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.115.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bsllmner_viewer"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
