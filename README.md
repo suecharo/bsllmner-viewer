@@ -79,8 +79,9 @@ docker compose exec app uv run python -m bsllmner_viewer.etl build-ontology --on
 
 | ファイル | 内容 |
 |---|---|
-| [data-model.md](docs/data-model.md) | 5 parquet schema (samples / facts / runs / ontology / chip_atlas_links)、ontology_source 命名規約、extract_status 決定ロジック |
+| [data-model.md](docs/data-model.md) | parquet schema (samples / facts / runs / ontology)、ontology_source 命名規約、extract_status 決定ロジック |
 | [etl.md](docs/etl.md) | 入力 source、normalize、streaming、CLI subcommand、出力 path、エラー方針、test 構成 |
+| [ui.md](docs/ui.md) | Streamlit UI 3 画面の責務、操作要素、lib/ 共通層 API、開発ステップ |
 
 ## ライセンス
 

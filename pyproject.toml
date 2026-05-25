@@ -72,7 +72,12 @@ strict = true
 files = ["src", "tests", "scripts"]
 
 [[tool.mypy.overrides]]
-module = ["ijson", "ijson.*", "pyarrow", "pyarrow.*"]
+module = [
+    "ijson", "ijson.*",
+    "pyarrow", "pyarrow.*",
+    "pandas", "pandas.*",
+    "plotly", "plotly.*",
+]
 ignore_missing_imports = true
 
 # pyarrow に型情報がないので write_table 等の untyped call を許す

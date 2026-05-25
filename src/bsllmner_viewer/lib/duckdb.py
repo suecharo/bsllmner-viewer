@@ -1,0 +1,25 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import duckdb
+
+_PARQUET_NAMES = ("samples", "facts", "runs", "ontology")
+
+
+def default_parquet_dir() -> Path:
+    return Path(os.environ.get("BSLLMNER_VIEWER_DATA_DIR", "/app/data")) / "parquet"
+
+
+def get_conn(parquet_dir: Path | None = None) -> duckdb.DuckDBPyConnection:
+    pdir = parquet_dir if parquet_dir is not None else default_parquet_dir()
+    con = duckdb.connect(database=":memory:")
+    for name in _PARQUET_NAMES:
+        path = pdir / f"{name}.parquet"
+        if path.exists():
+            escaped = str(path).replace("'", "''")
+            con.execute(
+                f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{escaped}')"
+            )
+    return con

@@ -24,7 +24,6 @@ _SCHEMA = pa.schema(
         pa.field("run_name", pa.string(), nullable=False),
         pa.field("in_chip_atlas", pa.bool_(), nullable=False),
         pa.field("chip_atlas_genome", pa.string(), nullable=True),
-        pa.field("chip_atlas_srx_count", pa.int32(), nullable=False),
     ]
 )
 
@@ -62,7 +61,6 @@ def _make_row(
         "run_name": run_name,
         "in_chip_atlas": source.in_chip_atlas,
         "chip_atlas_genome": source.chip_atlas_genome,
-        "chip_atlas_srx_count": 0,
     }
 
 
