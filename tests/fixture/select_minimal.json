@@ -1,0 +1,116 @@
+{
+  "entries": [
+    {
+      "extract": {
+        "accession": "SAMN00000001",
+        "extracted": {
+          "cell_line": "HeLa",
+          "cell_type": null,
+          "tissue": null,
+          "disease": null,
+          "drug": null,
+          "knockout_gene": null,
+          "knockdown_gene": null,
+          "overexpressed_gene": null
+        },
+        "raw_output": "{\"cell_line\": \"HeLa\"}",
+        "llm_timing": {
+          "total_duration": 1000000000,
+          "load_duration": 100000000,
+          "eval_count": 50,
+          "eval_duration": 500000000,
+          "prompt_eval_count": 100
+        }
+      },
+      "results": {
+        "cell_line": [
+          {
+            "value": "HeLa",
+            "term_id": "CVCL:0030",
+            "term_uri": "http://purl.obolibrary.org/obo/Cellosaurus#CVCL_0030",
+            "label": "HeLa",
+            "exact_match": true,
+            "reasoning": "Exact match on rdfs:label"
+          }
+        ],
+        "cell_type": [],
+        "tissue": [],
+        "disease": [],
+        "drug": [],
+        "knockout_gene": [],
+        "knockdown_gene": [],
+        "overexpressed_gene": []
+      }
+    },
+    {
+      "extract": {
+        "accession": "SAMN00000002",
+        "extracted": null,
+        "raw_output": null,
+        "llm_timing": {
+          "total_duration": 1000000000,
+          "load_duration": 100000000,
+          "eval_count": 50,
+          "eval_duration": 500000000,
+          "prompt_eval_count": 100
+        }
+      },
+      "results": {
+        "cell_line": [],
+        "cell_type": [],
+        "tissue": [],
+        "disease": [],
+        "drug": [],
+        "knockout_gene": [],
+        "knockdown_gene": [],
+        "overexpressed_gene": []
+      }
+    },
+    {
+      "extract": {
+        "accession": "SAMN00000003",
+        "extracted": {
+          "cell_line": "UnknownCell",
+          "cell_type": null,
+          "tissue": null,
+          "disease": null,
+          "drug": ["unknown_drug_1", "unknown_drug_2"],
+          "knockout_gene": null,
+          "knockdown_gene": null,
+          "overexpressed_gene": null
+        },
+        "raw_output": "{...}",
+        "llm_timing": {
+          "total_duration": 1000000000,
+          "load_duration": 100000000,
+          "eval_count": 50,
+          "eval_duration": 500000000,
+          "prompt_eval_count": 100
+        }
+      },
+      "results": {
+        "cell_line": [],
+        "cell_type": [],
+        "tissue": [],
+        "disease": [],
+        "drug": [],
+        "knockout_gene": [],
+        "knockdown_gene": [],
+        "overexpressed_gene": []
+      }
+    }
+  ],
+  "run_metadata": {
+    "run_name": "test_run_v1",
+    "model": "test-model",
+    "thinking": false,
+    "start_time": "2026-01-01T00:00:00Z",
+    "end_time": "2026-01-01T00:10:00Z",
+    "status": "completed",
+    "processing_time_sec": 600.0,
+    "total_entries": 3
+  },
+  "evaluation": null,
+  "performance": null,
+  "errors": []
+}

@@ -10,11 +10,14 @@ authors = [
 ]
 dependencies = [
     "duckdb>=1.1.0",
+    "ijson>=3.5.0",
+    "owlready2>=0.50",
     "pandas>=2.2.0",
     "plotly>=5.24.0",
     "pyarrow>=17.0.0",
     "pydantic>=2.9.0",
     "streamlit>=1.39.0",
+    "typer>=0.25.1",
 ]
 
 [dependency-groups]
@@ -53,11 +56,33 @@ select = [
     "SIM", # flake8-simplify
     "RUF", # ruff-specific
 ]
+# 日本語コメント・docstring 内の全角句読点を許可する (RUF001-003)
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# Streamlit の page module 命名規約 (Home.py / 1_Some_Page.py) は N999 に引っかかる
+"src/bsllmner_viewer/ui/**/*.py" = ["N999"]
+# typer の Option default に関数呼び出しを置くのは慣用句
+"src/bsllmner_viewer/etl/cli.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 files = ["src", "tests", "scripts"]
+
+[[tool.mypy.overrides]]
+module = ["owlready2", "owlready2.*", "ijson", "ijson.*", "pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+# pyarrow に型情報がないので write_table 等の untyped call を許す
+[[tool.mypy.overrides]]
+module = [
+    "bsllmner_viewer.etl.build_runs",
+    "bsllmner_viewer.etl.build_samples",
+    "bsllmner_viewer.etl.build_facts",
+    "bsllmner_viewer.etl.build_ontology",
+]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
