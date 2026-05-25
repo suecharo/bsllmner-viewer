@@ -66,7 +66,7 @@ if total > LIMIT:
 
 st.dataframe(
     df,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "accession": st.column_config.TextColumn(width="small"),
@@ -109,7 +109,7 @@ links_df = pd.DataFrame(
 
 st.dataframe(
     links_df,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "DDBJ Search": st.column_config.LinkColumn(

@@ -12,6 +12,7 @@ dependencies = [
     "duckdb>=1.1.0",
     "ijson>=3.5.0",
     "lxml>=6.1.1",
+    "numpy>=2.4.6",
     "pandas>=2.2.0",
     "plotly>=5.24.0",
     "pyarrow>=17.0.0",

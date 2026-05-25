@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import duckdb
 import streamlit as st
 
@@ -43,24 +45,38 @@ def sidebar_filters(con: duckdb.DuckDBPyConnection) -> SampleFilters:
     year_min, year_max = _year_bounds(con)
 
     st.sidebar.header("Filters")
+    # When a widget has a `key`, st.session_state is the source of truth — passing
+    # both `default=` (or `value=`) and a populated key triggers Streamlit's
+    # session_state-vs-widget-default warning. Seed defaults via session_state
+    # ahead of widget instantiation (see Cohort page) instead.
+    if "filter_organism" not in st.session_state:
+        st.session_state["filter_organism"] = []
+    if "filter_source" not in st.session_state:
+        st.session_state["filter_source"] = []
+    if "filter_chip_atlas" not in st.session_state:
+        st.session_state["filter_chip_atlas"] = "All"
+    if "filter_year" not in st.session_state:
+        st.session_state["filter_year"] = (year_min, year_max)
+
     selected_organisms = st.sidebar.multiselect(
-        "Organism", options=organisms, default=[], key="filter_organism"
+        "Organism", options=organisms, key="filter_organism"
     )
     selected_sources = st.sidebar.multiselect(
-        "Source system", options=sources, default=[], key="filter_source"
+        "Source system", options=sources, key="filter_source"
     )
     chip_choice = st.sidebar.radio(
         "ChIP-Atlas",
         options=["All", "Only ChIP-Atlas", "Exclude ChIP-Atlas"],
-        index=0,
         key="filter_chip_atlas",
     )
-    year_range = st.sidebar.slider(
-        "Submission year",
-        min_value=year_min,
-        max_value=year_max,
-        value=(year_min, year_max),
-        key="filter_year",
+    year_range = cast(
+        tuple[int, int],
+        st.sidebar.slider(
+            "Submission year",
+            min_value=year_min,
+            max_value=year_max,
+            key="filter_year",
+        ),
     )
 
     in_chip_atlas: bool | None = None

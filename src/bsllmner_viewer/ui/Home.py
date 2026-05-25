@@ -56,7 +56,7 @@ def _runs_table() -> object:
 
 
 st.subheader("Runs")
-st.dataframe(_runs_table(), use_container_width=True, hide_index=True)
+st.dataframe(_runs_table(), width="stretch", hide_index=True)
 
 st.divider()
 

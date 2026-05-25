@@ -38,6 +38,17 @@ _ROWS: list[tuple[str, str, str, str, int]] = [
     ("T:4", "TEST", "other-child", "T:4", 1),
     ("U:1", "TEST2", "u-root", "U:1", 0),
     ("C:1", "CELL", "c1", "C:1", 0),
+    # MONDO hierarchy used by roll-up tests (matches FIELD_TO_ONTOLOGY['disease']):
+    #   MONDO:1 'neoplasm' (depth=0, root)
+    #     └── MONDO:10 'breast neoplasm' (depth=1)
+    #     └── MONDO:11 'lung neoplasm' (depth=1)
+    #   MONDO:2 'diabetes' (depth=0, root)
+    ("MONDO:1", "MONDO", "neoplasm", "MONDO:1", 0),
+    ("MONDO:2", "MONDO", "diabetes", "MONDO:2", 0),
+    ("MONDO:10", "MONDO", "breast neoplasm", "MONDO:1", 1),
+    ("MONDO:10", "MONDO", "breast neoplasm", "MONDO:10", 1),
+    ("MONDO:11", "MONDO", "lung neoplasm", "MONDO:1", 1),
+    ("MONDO:11", "MONDO", "lung neoplasm", "MONDO:11", 1),
 ]
 
 
@@ -100,6 +111,12 @@ _SAMPLES_ROWS = [
      "src1", "run1", True, "hg38"),
     ("A3", "Mus musculus", "Mus musculus", 2025, "PRJ2", "Sample A3",
      "src2", "run2", False, None),
+    # A4 / A5 carry leaf MONDO terms one level below the root, used by
+    # the depth=0 roll-up tests.
+    ("A4", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A4",
+     "src1", "run1", True, "hg38"),
+    ("A5", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A5",
+     "src1", "run1", True, "hg38"),
 ]
 
 _FACTS_ROWS = [
@@ -111,6 +128,12 @@ _FACTS_ROWS = [
     ("A2", "run1", "drug",    "ibuprofen", "CHEBI:2", "ibuprofen", True, 1.0, "ChEBI", "ok"),
     # A3: disease=MONDO:2, no drug
     ("A3", "run2", "disease", "diabetes", "MONDO:2", "diabetes", True, 1.0, "MONDO", "ok"),
+    # A4: disease=MONDO:10 (leaf, child of MONDO:1)
+    ("A4", "run1", "disease", "breast cancer", "MONDO:10",
+     "breast neoplasm", True, 1.0, "MONDO", "ok"),
+    # A5: disease=MONDO:11 (leaf, child of MONDO:1)
+    ("A5", "run1", "disease", "lung cancer", "MONDO:11",
+     "lung neoplasm", True, 1.0, "MONDO", "ok"),
 ]
 
 

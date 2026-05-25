@@ -9,7 +9,7 @@ def test_get_conn_creates_view_for_existing_parquet(fixture_parquet_dir: Path) -
     con = get_conn(parquet_dir=fixture_parquet_dir)
     n = con.execute("SELECT COUNT(*) FROM ontology").fetchone()
     assert n is not None
-    assert n[0] == 10
+    assert n[0] == 16
 
 
 def test_get_conn_skips_missing_parquet(fixture_parquet_dir: Path) -> None:
