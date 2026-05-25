@@ -101,24 +101,26 @@ extraction 失敗 / mapping 失敗の row も必ず保持する（curation repor
 
 ### 対象 ontology と source ファイル
 
-bsllmner-mk2 の `ontology/` を read-only bind mount で参照する。
+bsllmner-mk2 の `ontology/` を read-only bind mount で参照する。subset OWL は **term の集合と label を定義する側**、フル OWL は **hierarchy（`rdfs:subClassOf`）を提供する側**。subset OWL は bsllmner-mk2 が text2term の検索範囲を絞るために生成したもので、親クラスへの参照は剥がされている（`rdfs:subClassOf` が 0 件）。そのため bsllmner-viewer は subset から term_id / label を取り、hierarchy はフル OWL から補完する。
 
-| ontology_source | source file (bsllmner-mk2/ontology/) | 備考 |
-|---|---|---|
-| `Cellosaurus` | `cellosaurus.owl` | full 版（subset の `cellosaurus_human/mouse.owl` は bsllmner-mk2 Docker で生成、bsllmner-viewer 側では生成しない）。272MB |
-| `CL` | `cl_human_subset.owl` + `cl_mouse_subset.owl` を union | |
-| `UBERON` | `uberon_human_subset.owl` + `uberon_mouse_subset.owl` を union | |
-| `MONDO` | `mondo_human_subset.owl` | mouse 用 subset は無く human 用を流用（bsllmner-mk2 ontology.md 記載通り） |
-| `ChEBI` | `chebi_subset.owl` | 140MB |
+| ontology_source | subset (term_id + label の source) | hierarchy (`rdfs:subClassOf` の source) | 備考 |
+|---|---|---|---|
+| `Cellosaurus` | `cellosaurus.owl` | `cellosaurus.owl` | subset を持たないので「全体 = subset」扱い。272MB |
+| `CL` | `cl_human_subset.owl` + `cl_mouse_subset.owl` を union | `cl.owl` | |
+| `UBERON` | `uberon_human_subset.owl` + `uberon_mouse_subset.owl` を union | `uberon.owl` | |
+| `MONDO` | `mondo_human_subset.owl` | `mondo.owl` | mouse 用 subset は無く human 用を流用（bsllmner-mk2 ontology.md 記載通り） |
+| `ChEBI` | `chebi_subset.owl` | `chebi.owl` | 140MB / 774MB |
 
 NCBI Gene は hierarchy が薄いため `ontology.parquet` に含めない（design-memo §6）。
 
 ### parse / hierarchy 抽出
 
-- ライブラリ: `owlready2`
-- `rdfs:subClassOf` を辿って transitive closure を取る
-- 複数親の場合、すべての (term, parent) ペアを row 化（重複 row は許容、`(term_id, parent_term_id)` で unique）
-- `depth` は BFS で求める。root を depth=0 とし、複数 root の場合は最小値
+- ライブラリ: `lxml.etree.iterparse`（streaming）。owlready2 / rdflib は使わない（フル OWL が 700MB クラスのため in-memory load を避ける）
+- subset OWL を streaming parse して `(term_id, label)` を集める（= subset の term 集合 + label map）
+- フル OWL を streaming parse して `(child_term_id, parent_term_id)` のペアを取り、**child と parent の両方が subset の term 集合に含まれる pair だけ採用**する。subset 外の term には親が伸びないので、subset 外の祖先 term は `ontology.parquet` に出現しない
+- 採用した parent map に対して transitive closure を取り、`(term_id, parent_term_id)` を全 ancestor 分 row 化（自分自身も `parent_term_id = term_id` で 1 row 入れる）
+- `depth` は subset 内グラフ上で BFS。root（subset 内に親を持たない term）を depth=0、複数 root なら最小値
+- `rdfs:subClassOf` の object が blank node や `owl:Restriction` の場合は無視（`rdf:resource` 属性付きで直接 IRI を参照しているものだけ採用する）
 
 ### 命名統一: URI → term_id
 

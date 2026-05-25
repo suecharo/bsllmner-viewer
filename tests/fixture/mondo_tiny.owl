@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<rdf:RDF xmlns="http://www.w3.org/2002/07/owl#"
+     xml:base="http://www.w3.org/2002/07/owl"
+     xmlns:obo="http://purl.obolibrary.org/obo/"
+     xmlns:owl="http://www.w3.org/2002/07/owl#"
+     xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+     xmlns:xsd="http://www.w3.org/2001/XMLSchema#"
+     xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#">
+
+    <Ontology/>
+
+    <!-- root: label あり、subClassOf なし -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000001">
+        <rdfs:label>disease A</rdfs:label>
+    </Class>
+
+    <!-- 単親: B is_a A、label あり -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000002">
+        <rdfs:label>disease B</rdfs:label>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000001"/>
+    </Class>
+
+    <!-- 多親: C is_a A, B、label なし (None になる) -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000003">
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000001"/>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000002"/>
+    </Class>
+
+    <!-- self-loop は除外されるべき -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000004">
+        <rdfs:label>disease D</rdfs:label>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000004"/>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000001"/>
+    </Class>
+
+    <!-- blank node の subClassOf (rdf:resource なし) は skip されるべき -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000005">
+        <rdfs:label>disease E</rdfs:label>
+        <rdfs:subClassOf>
+            <Class>
+                <intersectionOf rdf:parseType="Collection"/>
+            </Class>
+        </rdfs:subClassOf>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000001"/>
+    </Class>
+
+    <!-- owl:Restriction を持つ subClassOf も skip されるべき -->
+    <Class rdf:about="http://purl.obolibrary.org/obo/MONDO_0000006">
+        <rdfs:label>disease F</rdfs:label>
+        <rdfs:subClassOf>
+            <Restriction>
+                <onProperty rdf:resource="http://example.org/p"/>
+                <someValuesFrom rdf:resource="http://example.org/q"/>
+            </Restriction>
+        </rdfs:subClassOf>
+    </Class>
+
+    <!-- prefix 不明 (example.org): iri_to_term_id が None を返すので skip されるべき -->
+    <Class rdf:about="http://example.org/X_0000007">
+        <rdfs:label>unrelated class</rdfs:label>
+        <rdfs:subClassOf rdf:resource="http://purl.obolibrary.org/obo/MONDO_0000001"/>
+    </Class>
+
+</rdf:RDF>

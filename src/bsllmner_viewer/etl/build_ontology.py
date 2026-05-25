@@ -5,9 +5,8 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from owlready2 import ThingClass, get_ontology
 
-from bsllmner_viewer.etl.term_id import iri_to_term_id
+from bsllmner_viewer.etl.load_owl import iter_class_labels, iter_subclass_edges
 
 logger = logging.getLogger(__name__)
 
@@ -22,52 +21,60 @@ _SCHEMA = pa.schema(
 )
 
 
-_ONTOLOGY_FILES: dict[str, tuple[str, ...]] = {
-    "Cellosaurus": ("cellosaurus.owl",),
-    "CL": ("cl_human_subset.owl", "cl_mouse_subset.owl"),
-    "UBERON": ("uberon_human_subset.owl", "uberon_mouse_subset.owl"),
-    "MONDO": ("mondo_human_subset.owl",),
-    "ChEBI": ("chebi_subset.owl",),
+# 各 ontology_source ごとの (subset OWL = term_id + label の source) と
+# (hierarchy OWL = rdfs:subClassOf の source) ペア。Cellosaurus は subset を
+# 持たないので両方 cellosaurus.owl を指す (全体を subset 扱い)。
+# docs/data-model.md「対象 ontology と source ファイル」と一対一対応する。
+_ONTOLOGY_SOURCES: dict[str, tuple[tuple[str, ...], str]] = {
+    "Cellosaurus": (("cellosaurus.owl",), "cellosaurus.owl"),
+    "CL": (("cl_human_subset.owl", "cl_mouse_subset.owl"), "cl.owl"),
+    "UBERON": (
+        ("uberon_human_subset.owl", "uberon_mouse_subset.owl"),
+        "uberon.owl",
+    ),
+    "MONDO": (("mondo_human_subset.owl",), "mondo.owl"),
+    "ChEBI": (("chebi_subset.owl",), "chebi.owl"),
 }
 
 
-def _collect_classes(
-    files: Iterable[Path],
-) -> tuple[dict[str, str | None], dict[str, set[str]]]:
-    """OWL ファイル群を load → (term_id → label, term_id → direct parents) を返す。
+def _collect_subset(files: Iterable[Path]) -> dict[str, str | None]:
+    """subset OWL 群から term_id → label (None 可) を集める。
 
-    複数 OWL を union するときは、後勝ちで label を補完、parents は set union する。
+    同じ term_id が複数 subset に出る場合は、先に出た label を残しつつ None を
+    後から非 None で上書き補完する。
     """
     labels: dict[str, str | None] = {}
-    parents: dict[str, set[str]] = defaultdict(set)
     for path in files:
-        logger.info("loading OWL: %s", path)
-        onto = get_ontology(f"file://{path.resolve()}").load()
-        for cls in onto.classes():
-            term_id = iri_to_term_id(cls.iri)
-            if not term_id:
-                continue
-            label = cls.label.first() if cls.label else None
-            if labels.get(term_id) is None and label is not None:
+        logger.info("loading subset OWL: %s", path)
+        for term_id, label in iter_class_labels(path):
+            if term_id not in labels or (labels[term_id] is None and label is not None):
                 labels[term_id] = label
-            elif term_id not in labels:
-                labels[term_id] = None
-            for parent_cls in cls.is_a:
-                if not isinstance(parent_cls, ThingClass):
-                    continue
-                parent_id = iri_to_term_id(parent_cls.iri)
-                if parent_id and parent_id != term_id:
-                    parents[term_id].add(parent_id)
 
-    return labels, parents
+    return labels
+
+
+def _collect_hierarchy(
+    path: Path, allowed_terms: set[str]
+) -> dict[str, set[str]]:
+    """hierarchy OWL の rdfs:subClassOf から、child / parent ともに `allowed_terms`
+    に含まれるペアのみを採用した parent map を返す。
+    """
+    parents: dict[str, set[str]] = defaultdict(set)
+    logger.info("loading hierarchy OWL: %s", path)
+    for child, parent in iter_subclass_edges(path):
+        if child in allowed_terms and parent in allowed_terms:
+            parents[child].add(parent)
+
+    return parents
 
 
 def _compute_depths(
     parents: dict[str, set[str]], all_terms: set[str]
 ) -> dict[str, int]:
-    """各 term の depth を BFS で求める。root は depth=0。複数 root の場合は min(distance)。
+    """各 term の depth を root からの BFS 最短距離として求める。複数 root なら最小値。
 
-    children map (reverse of parents) を作って top-down BFS。
+    呼び出し側で parent map は `all_terms` 内に restrict 済みである前提
+    (`_collect_hierarchy` が child / parent 両方を filter しているため成立)。
     """
     children: dict[str, set[str]] = defaultdict(set)
     for term, ps in parents.items():
@@ -90,8 +97,8 @@ def _compute_depths(
     return depth
 
 
-def _all_ancestors_with_self(term: str, parents: dict[str, set[str]]) -> set[str]:
-    """term の祖先 + self を集合で返す（transitive closure + self loop）。"""
+def _ancestors_with_self(term: str, parents: dict[str, set[str]]) -> set[str]:
+    """`term` の祖先 + self を集合で返す (transitive closure + self loop 用 self)。"""
     seen = {term}
     queue: deque[str] = deque([term])
     while queue:
@@ -104,32 +111,30 @@ def _all_ancestors_with_self(term: str, parents: dict[str, set[str]]) -> set[str
     return seen
 
 
-def _build_rows_for_source(
-    source: str, ontology_dir: Path
+def build_source_rows(
+    source: str, labels: dict[str, str | None], parents: dict[str, set[str]]
 ) -> list[dict[str, object]]:
-    files = [ontology_dir / name for name in _ONTOLOGY_FILES[source]]
-    missing = [str(p) for p in files if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"missing OWL file(s) for {source}: {', '.join(missing)}"
-        )
-    labels, parents = _collect_classes(files)
+    """1 ontology_source 分の row 群を組み立てる (parquet 書き出し前段)。
+
+    test から `_collect_subset` / `_collect_hierarchy` を経ずに直接呼べるよう
+    public にする (subset 外 restrict のテスト用)。
+    """
     all_terms = set(labels.keys())
     depths = _compute_depths(parents, all_terms)
     rows: list[dict[str, object]] = []
-    for term in all_terms:
-        ancestors = _all_ancestors_with_self(term, parents)
-        for ancestor in ancestors:
+    for term in sorted(all_terms):
+        depth = depths[term]
+        label = labels[term]
+        for ancestor in _ancestors_with_self(term, parents):
             rows.append(
                 {
                     "term_id": term,
                     "ontology_source": source,
-                    "label": labels.get(term),
+                    "label": label,
                     "parent_term_id": ancestor,
-                    "depth": depths.get(term, 0),
+                    "depth": depth,
                 }
             )
-    logger.info("source=%s: %d terms, %d rows", source, len(all_terms), len(rows))
 
     return rows
 
@@ -137,12 +142,31 @@ def _build_rows_for_source(
 def build_ontology(
     ontology_dir: Path, out_path: Path, sources: tuple[str, ...] | None = None
 ) -> None:
-    target = set(sources) if sources else set(_ONTOLOGY_FILES.keys())
+    target = set(sources) if sources else set(_ONTOLOGY_SOURCES.keys())
     rows: list[dict[str, object]] = []
-    for source in _ONTOLOGY_FILES:
+    for source, (subset_names, hierarchy_name) in _ONTOLOGY_SOURCES.items():
         if source not in target:
             continue
-        rows.extend(_build_rows_for_source(source, ontology_dir))
+        subset_files = [ontology_dir / name for name in subset_names]
+        hierarchy_file = ontology_dir / hierarchy_name
+        missing = [
+            str(p) for p in [*subset_files, hierarchy_file] if not p.exists()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"missing OWL file(s) for {source}: {', '.join(missing)}"
+            )
+        labels = _collect_subset(subset_files)
+        parents = _collect_hierarchy(hierarchy_file, set(labels.keys()))
+        source_rows = build_source_rows(source, labels, parents)
+        logger.info(
+            "source=%s: %d terms, %d edges, %d rows",
+            source,
+            len(labels),
+            sum(len(ps) for ps in parents.values()),
+            len(source_rows),
+        )
+        rows.extend(source_rows)
 
     table = pa.Table.from_pylist(rows, schema=_SCHEMA)
     out_path.parent.mkdir(parents=True, exist_ok=True)

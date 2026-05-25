@@ -11,7 +11,7 @@ authors = [
 dependencies = [
     "duckdb>=1.1.0",
     "ijson>=3.5.0",
-    "owlready2>=0.50",
+    "lxml>=6.1.1",
     "pandas>=2.2.0",
     "plotly>=5.24.0",
     "pyarrow>=17.0.0",
@@ -23,6 +23,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "hypothesis>=6.115.0",
+    "lxml-stubs>=0.5.1",
     "mypy>=1.13.0",
     "pytest>=8.3.0",
     "pytest-cov>=6.0.0",
@@ -71,7 +72,7 @@ strict = true
 files = ["src", "tests", "scripts"]
 
 [[tool.mypy.overrides]]
-module = ["owlready2", "owlready2.*", "ijson", "ijson.*", "pyarrow", "pyarrow.*"]
+module = ["ijson", "ijson.*", "pyarrow", "pyarrow.*"]
 ignore_missing_imports = true
 
 # pyarrow に型情報がないので write_table 等の untyped call を許す
