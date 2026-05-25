@@ -13,6 +13,7 @@ from bsllmner_viewer.lib.aggregation import (
 )
 from bsllmner_viewer.ui._conn import conn
 from bsllmner_viewer.ui._filters import sidebar_filters
+from bsllmner_viewer.ui._term_popover import render_term_popover
 
 st.set_page_config(page_title="Gapminder — bsllmner-viewer", layout="wide")
 
@@ -280,3 +281,13 @@ with tab_line:
         f"Y axis: {'log' if y_log else 'linear'} · "
         f"Mode: {mode.lower()}."
     )
+
+# Show the Top N (term_id, label) selection from the underlying dataset and
+# expose each one as a term-info popover. The bubble chart itself can't be
+# wired to a click handler, so this section is the navigation hand-off.
+st.subheader(f"Top terms for `{field_name}`")
+term_label_map = (
+    df.drop_duplicates("term_id").set_index("term_id")["label"].to_dict()
+)
+for term_id, lbl in term_label_map.items():
+    render_term_popover(con, field_name, term_id, lbl, filters)

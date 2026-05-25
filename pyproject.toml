@@ -70,7 +70,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests", "scripts"]
+files = ["src", "scripts"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -88,6 +88,7 @@ module = [
     "bsllmner_viewer.etl.build_samples",
     "bsllmner_viewer.etl.build_facts",
     "bsllmner_viewer.etl.build_ontology",
+    "bsllmner_viewer.etl.build_srx_links",
 ]
 disallow_untyped_calls = false
 

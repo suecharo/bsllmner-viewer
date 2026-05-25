@@ -13,6 +13,7 @@ from bsllmner_viewer.lib.aggregation import (
 )
 from bsllmner_viewer.ui._conn import conn
 from bsllmner_viewer.ui._filters import sidebar_filters
+from bsllmner_viewer.ui._term_popover import render_term_popover
 
 st.set_page_config(page_title="Gap Discovery — bsllmner-viewer", layout="wide")
 
@@ -137,127 +138,252 @@ overlay_counts = (
     .reindex(index=pivot_counts.index, columns=pivot_counts.columns, fill_value=0)
 )
 
-custom = overlay_counts.to_numpy()
 fig = px.imshow(
     pivot_counts,
     aspect="auto",
     color_continuous_scale="Blues",
     labels={"x": x_field, "y": y_field, "color": "BioSample count"},
 )
-fig.update_traces(
-    customdata=custom,
+
+# Overlay one transparent square per heatmap cell so a single click maps back
+# to (x_label, y_label) — Plotly's Heatmap trace alone doesn't surface point
+# selection events through Streamlit's selection API. The overlay also owns
+# the hover tooltip: since it sits on top of the heatmap, the heatmap's own
+# hovertemplate would otherwise be masked. We match the marker shape/size so
+# the hit + hover area covers (almost) the full cell.
+overlay_x: list[str] = []
+overlay_y: list[str] = []
+overlay_custom: list[list[int]] = []
+for y_lbl in pivot_counts.index:
+    for x_lbl in pivot_counts.columns:
+        overlay_x.append(x_lbl)
+        overlay_y.append(y_lbl)
+        overlay_custom.append(
+            [
+                int(pivot_counts.loc[y_lbl, x_lbl]),
+                int(overlay_counts.loc[y_lbl, x_lbl]),
+            ]
+        )
+fig.add_scatter(
+    x=overlay_x,
+    y=overlay_y,
+    mode="markers",
+    marker={
+        "symbol": "square",
+        "size": 36,
+        "color": "rgba(0,0,0,0)",
+        "line": {"width": 0},
+    },
+    customdata=overlay_custom,
     hovertemplate=(
         f"{x_field}: %{{x}}<br>"
         f"{y_field}: %{{y}}<br>"
-        "BioSample: %{z}<br>"
-        "of which ChIP-Atlas: %{customdata}<extra></extra>"
+        "BioSample: %{customdata[0]}<br>"
+        "of which ChIP-Atlas: %{customdata[1]}<extra></extra>"
     ),
-)
-
-# Overlay an invisible scatter trace so Streamlit's on_select="rerun" + box /
-# lasso selection mode can map clicks back to (x_label, y_label). Plotly's
-# Heatmap trace alone doesn't emit point selection events through Streamlit's
-# selection API — point-mode click on the imshow surface never fires
-# `selection.points`. Box / lasso select on the overlay does work and lets the
-# user pick a single (or multi-) cell visually.
-overlay_rows = [
-    {"x": x_lbl, "y": y_lbl}
-    for y_lbl in pivot_counts.index
-    for x_lbl in pivot_counts.columns
-]
-overlay_df = pd.DataFrame(overlay_rows)
-fig.add_scatter(
-    x=overlay_df["x"],
-    y=overlay_df["y"],
-    mode="markers",
-    marker={"size": 22, "color": "rgba(0,0,0,0)", "line": {"width": 0}},
-    hoverinfo="skip",
     showlegend=False,
     name="cell-select",
 )
 
-fig.update_layout(height=max(400, 30 * len(pivot_counts.index)))
+fig.update_layout(
+    height=max(400, 30 * len(pivot_counts.index)),
+    dragmode="pan",
+    clickmode="event+select",
+    modebar={"remove": ["fullscreen", "togglefullscreen", "select", "lasso2d"]},
+)
 
+# Embed the axes and a "clear" nonce in the chart key so axis changes and the
+# Clear button both yield a fresh chart instance with no carried-over click
+# selection (otherwise Streamlit would replay the stale selection on rerun and
+# re-add the cell to the table).
+clear_nonce = st.session_state.get("gap_heatmap_clear_nonce", 0)
+chart_key = f"gap_heatmap__{x_field}__{y_field}__{clear_nonce}"
 chart_event: object = st.plotly_chart(
     fig,
     width="stretch",
-    key="gap_heatmap",
+    key=chart_key,
     on_select="rerun",
-    selection_mode=("points", "box"),
+    selection_mode="points",
 )
+
+
+def _extract_selected_labels(event: object) -> list[tuple[str, str]]:
+    """Pull (x_label, y_label) pairs out of Streamlit's PlotlyState.
+
+    PlotlyState supports both ``event["selection"]`` and ``event.selection``;
+    ``isinstance(event, dict)`` is False on streamlit>=1.30, so we duck-type
+    each access. The overlay scatter's x/y values are the axis labels, so we
+    map them straight back to (label, label).
+    """
+    if event is None:
+        return []
+    sel: object = None
+    try:
+        sel = event["selection"]  # type: ignore[index]
+    except (TypeError, KeyError, IndexError):
+        sel = None
+    if sel is None:
+        sel = getattr(event, "selection", None)
+    if sel is None:
+        return []
+    pts: object = None
+    try:
+        pts = sel["points"]  # type: ignore[index]
+    except (TypeError, KeyError, IndexError):
+        pts = None
+    if pts is None:
+        pts = getattr(sel, "points", None)
+    if not pts:
+        return []
+    out: list[tuple[str, str]] = []
+    iterable_pts = list(pts)  # type: ignore[call-overload]
+    for p in iterable_pts:
+        if isinstance(p, dict):
+            x_val, y_val = p.get("x"), p.get("y")
+        else:
+            x_val, y_val = getattr(p, "x", None), getattr(p, "y", None)
+        if isinstance(x_val, str) and isinstance(y_val, str):
+            out.append((x_val, y_val))
+    return out
+
 
 x_label_to_id = dict(zip(df["x_label"], df["x_term_id"], strict=False))
 y_label_to_id = dict(zip(df["y_label"], df["y_term_id"], strict=False))
 
-# Streamlit's PlotlyState is dict-like: {'selection': {'points': [{...}, ...]}}.
-# Access dynamically to avoid leaking PlotlyState typing into our code.
-selection = (
-    chart_event["selection"]
-    if isinstance(chart_event, dict) and "selection" in chart_event
-    else None
-)
-points: list[dict[str, object]] = (
-    selection.get("points", [])
-    if isinstance(selection, dict)
-    else []
-)
-selected_labels: list[tuple[str, str]] = []
-for p in points:
-    x_val = p.get("x")
-    y_val = p.get("y")
-    if isinstance(x_val, str) and isinstance(y_val, str):
-        selected_labels.append((x_val, y_val))
-
-st.subheader("Drill into a cell")
-st.caption(
-    "Use the box-select tool on the heatmap toolbar to pick one or more cells, "
-    "or set the term selectors below directly. The first selected cell is "
-    "carried into the Cohort drill-down."
-)
-
-x_options = list(x_label_to_id.items())  # [(label, term_id), ...]
-y_options = list(y_label_to_id.items())
-
-x_default_idx = 0
-y_default_idx = 0
-if selected_labels:
-    first_x, first_y = selected_labels[0]
-    if first_x in x_label_to_id:
-        x_default_idx = [lbl for lbl, _ in x_options].index(first_x)
-    if first_y in y_label_to_id:
-        y_default_idx = [lbl for lbl, _ in y_options].index(first_y)
-
-cell_col1, cell_col2, cell_col3 = st.columns([2, 2, 1])
-with cell_col1:
-    chosen_x = st.selectbox(
-        f"{x_field} term",
-        options=x_options,
-        index=x_default_idx,
-        format_func=lambda p: f"{p[0]} ({p[1]})",
+# Surface the heatmap's Top N x / y terms with popovers so users can read
+# ontology metadata + sample counts without first picking a cell.
+with st.expander("Top axis terms (ontology info)", expanded=False):
+    col_x_terms, col_y_terms = st.columns(2)
+    x_term_label = dict(
+        zip(df["x_term_id"], df["x_label"], strict=False)
     )
-with cell_col2:
-    chosen_y = st.selectbox(
-        f"{y_field} term",
-        options=y_options,
-        index=y_default_idx,
-        format_func=lambda p: f"{p[0]} ({p[1]})",
+    y_term_label = dict(
+        zip(df["y_term_id"], df["y_label"], strict=False)
     )
-with cell_col3:
-    if st.button("Open in Cohort →", width="stretch"):
-        st.session_state["cohort_filters"] = filters
-        st.session_state["cohort_facts_terms"] = [
-            (x_field, chosen_x[1]),
-            (y_field, chosen_y[1]),
-        ]
-        st.session_state["cohort_label"] = (
-            f"{x_field}={chosen_x[0]} × {y_field}={chosen_y[0]}"
+    with col_x_terms:
+        st.markdown(f"**X — {x_field}**")
+        for tid, lbl in x_term_label.items():
+            render_term_popover(con, x_field, tid, lbl, filters)
+    with col_y_terms:
+        st.markdown(f"**Y — {y_field}**")
+        for tid, lbl in y_term_label.items():
+            render_term_popover(con, y_field, tid, lbl, filters)
+
+selected_labels = _extract_selected_labels(chart_event)
+# Keep only selections that line up with a known axis label (defensive against
+# overlay scatter points that drifted off the heatmap grid).
+selected_labels = [
+    (x, y) for x, y in selected_labels
+    if x in x_label_to_id and y in y_label_to_id
+]
+
+# Switching axes invalidates previously picked cells — drop them so the table
+# only ever holds picks that are meaningful for the current axes.
+axis_key = (x_field, y_field)
+if st.session_state.get("gap_axis_key") != axis_key:
+    st.session_state["gap_selected_cells"] = []
+    st.session_state["gap_axis_key"] = axis_key
+
+cells: list[dict[str, str]] = st.session_state.setdefault(
+    "gap_selected_cells", []
+)
+existing_keys = {(c["x_label"], c["y_label"]) for c in cells}
+for x_lbl, y_lbl in selected_labels:
+    if (x_lbl, y_lbl) in existing_keys:
+        continue
+    cells.append(
+        {
+            "x_label": x_lbl,
+            "x_term_id": x_label_to_id[x_lbl],
+            "y_label": y_lbl,
+            "y_term_id": y_label_to_id[y_lbl],
+        }
+    )
+    existing_keys.add((x_lbl, y_lbl))
+
+st.subheader("Send selection to Cohort")
+st.markdown(
+    "1. **Click a cell** on the heatmap to add it to the table below. "
+    "Click again to pick more — they accumulate as the cohort.\n"
+    "2. Press **Open in Cohort →** to land in the drill-down with TSV "
+    "download and DDBJ Search links."
+)
+
+if cells:
+    rows = []
+    for c in cells:
+        sample_count = (
+            int(pivot_counts.loc[c["y_label"], c["x_label"]])
+            if c["y_label"] in pivot_counts.index
+            and c["x_label"] in pivot_counts.columns
+            else None
         )
+        chip_atlas_count = (
+            int(overlay_counts.loc[c["y_label"], c["x_label"]])
+            if c["y_label"] in overlay_counts.index
+            and c["x_label"] in overlay_counts.columns
+            else None
+        )
+        rows.append(
+            {
+                x_field: c["x_label"],
+                f"{x_field} term_id": c["x_term_id"],
+                y_field: c["y_label"],
+                f"{y_field} term_id": c["y_term_id"],
+                "BioSample": sample_count,
+                "of which ChIP-Atlas": chip_atlas_count,
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    # Per-cell-term popover row: collapse selected cells into the unique
+    # (field, term_id) terms involved, so the user can drill into ontology
+    # info for each side without re-clicking the heatmap.
+    selected_terms: dict[tuple[str, str], str] = {}
+    for c in cells:
+        selected_terms.setdefault((x_field, c["x_term_id"]), c["x_label"])
+        selected_terms.setdefault((y_field, c["y_term_id"]), c["y_label"])
+    st.caption("Term info for the selected cells:")
+    for (field_name, term_id), lbl in selected_terms.items():
+        render_term_popover(con, field_name, term_id, lbl, filters)
+else:
+    st.caption(
+        "No cells picked yet. Click a cell on the heatmap to add it here."
+    )
+
+button_col, clear_col = st.columns([1, 1])
+with button_col:
+    if st.button(
+        "Open in Cohort →",
+        type="primary",
+        width="stretch",
+        key="gap_open_cohort",
+        disabled=not cells,
+    ):
+        st.session_state["cohort_filters"] = filters
+        st.session_state["cohort_facts_cells"] = [
+            [(x_field, c["x_term_id"]), (y_field, c["y_term_id"])]
+            for c in cells
+        ]
+        st.session_state.pop("cohort_facts_terms", None)
+        if len(cells) == 1:
+            c = cells[0]
+            st.session_state["cohort_label"] = (
+                f"{x_field}={c['x_label']} × {y_field}={c['y_label']}"
+            )
+        else:
+            st.session_state["cohort_label"] = (
+                f"{len(cells)} cells on {x_field} × {y_field}"
+            )
         st.session_state.pop("cohort_seeded", None)
         st.switch_page("pages/02_Cohort.py")
-
-if selected_labels:
-    st.success(
-        f"{len(selected_labels)} cell(s) selected from heatmap — selectors "
-        f"primed to the first one ({selected_labels[0][0]} × "
-        f"{selected_labels[0][1]}). Click *Open in Cohort* to drill in."
-    )
+with clear_col:
+    if st.button(
+        "Clear selection",
+        width="stretch",
+        key="gap_clear_selection",
+        disabled=not cells,
+    ):
+        st.session_state["gap_selected_cells"] = []
+        st.session_state["gap_heatmap_clear_nonce"] = clear_nonce + 1
+        st.rerun()

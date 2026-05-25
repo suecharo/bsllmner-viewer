@@ -12,7 +12,24 @@ returns just the term itself.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import duckdb
+
+
+@dataclass(frozen=True)
+class TermSummary:
+    """Single-row view of an ontology term.
+
+    All ontology-derived fields are nullable because the term may not be in
+    `ontology.parquet` (e.g. NCBI Gene IDs are referenced from facts but not
+    materialized in ontology.parquet, see `docs/data-model.md`).
+    """
+
+    term_id: str
+    label: str | None
+    ontology_source: str | None
+    depth: int | None
 
 
 def label(con: duckdb.DuckDBPyConnection, term_id: str) -> str | None:
@@ -68,3 +85,53 @@ def terms_at_depth(
         [source, depth],
     ).fetchall()
     return [r[0] for r in rows]
+
+
+def term_summary(
+    con: duckdb.DuckDBPyConnection, term_id: str
+) -> TermSummary:
+    """Return label / ontology_source / depth for a term (None if absent)."""
+    row = con.execute(
+        "SELECT label, ontology_source, depth FROM ontology "
+        "WHERE term_id = ? AND parent_term_id = term_id LIMIT 1",
+        [term_id],
+    ).fetchone()
+    if row is None:
+        return TermSummary(
+            term_id=term_id, label=None, ontology_source=None, depth=None
+        )
+    label_value, source_value, depth_value = row
+    return TermSummary(
+        term_id=term_id,
+        label=label_value,
+        ontology_source=source_value,
+        depth=int(depth_value) if depth_value is not None else None,
+    )
+
+
+# Per-prefix URL builders. Each (site, builder) entry returns the user-facing
+# label and the absolute URL for the term. New ontologies extend this table —
+# `external_url` itself is just a dispatch over the term_id prefix.
+def external_url(term_id: str) -> tuple[str, str] | None:
+    """Build the official ontology page URL for a term_id.
+
+    Returns ``(site_label, url)`` on a known prefix, else ``None``.
+    """
+    prefix, _, local = term_id.partition(":")
+    if not local:
+        return None
+    if prefix == "MONDO":
+        return ("Monarch Initiative", f"https://monarchinitiative.org/disease/MONDO:{local}")
+    if prefix == "CL":
+        iri = f"http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FCL_{local}"
+        return ("EBI OLS (CL)", f"https://www.ebi.ac.uk/ols4/ontologies/cl/classes/{iri}")
+    if prefix == "UBERON":
+        iri = f"http%3A%2F%2Fpurl.obolibrary.org%2Fobo%2FUBERON_{local}"
+        return ("EBI OLS (UBERON)", f"https://www.ebi.ac.uk/ols4/ontologies/uberon/classes/{iri}")
+    if prefix == "CHEBI":
+        return ("EBI ChEBI", f"https://www.ebi.ac.uk/chebi/searchId.do?chebiId=CHEBI:{local}")
+    if prefix == "CVCL":
+        return ("Cellosaurus", f"https://www.cellosaurus.org/CVCL_{local}")
+    if prefix == "NCBIGene":
+        return ("NCBI Gene", f"https://www.ncbi.nlm.nih.gov/gene/{local}")
+    return None

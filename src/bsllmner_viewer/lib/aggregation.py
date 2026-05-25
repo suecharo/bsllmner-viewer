@@ -216,35 +216,88 @@ def gap_heatmap_pivot(
     return df
 
 
+def _facts_terms_clauses(
+    facts_terms: list[tuple[str, str]] | None,
+) -> tuple[list[str], list[object]]:
+    if not facts_terms:
+        return [], []
+    for field_name, _ in facts_terms:
+        _validate_field(field_name)
+    clauses: list[str] = []
+    params: list[object] = []
+    for field_name, term_id in facts_terms:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM facts f WHERE f.accession = s.accession "
+            "AND f.run_name = s.run_name AND f.field = ? AND f.term_id = ?)"
+        )
+        params.extend([field_name, term_id])
+    return clauses, params
+
+
+def _facts_cells_clauses(
+    facts_cells: list[list[tuple[str, str]]] | None,
+) -> tuple[list[str], list[object]]:
+    """Build OR-of-AND clauses for cell-shaped selections.
+
+    Each inner list is a single heatmap cell — its (field, term_id) entries
+    must all match (AND). Cells are joined with OR so multiple picks form a
+    union cohort. Empty cells are skipped to avoid emitting an empty AND that
+    would short-circuit the OR.
+    """
+    if not facts_cells:
+        return [], []
+    or_parts: list[str] = []
+    params: list[object] = []
+    for cell in facts_cells:
+        if not cell:
+            continue
+        sub_clauses, sub_params = _facts_terms_clauses(cell)
+        or_parts.append("(" + " AND ".join(sub_clauses) + ")")
+        params.extend(sub_params)
+    if not or_parts:
+        return [], []
+    return ["(" + " OR ".join(or_parts) + ")"], params
+
+
 def cohort_samples(
     con: duckdb.DuckDBPyConnection,
     filters: SampleFilters,
     facts_terms: list[tuple[str, str]] | None = None,
+    facts_cells: list[list[tuple[str, str]]] | None = None,
     limit: int = 10000,
 ) -> pd.DataFrame:
     """Return matching samples for a cohort.
 
     ``facts_terms`` is a list of (field, term_id) pairs that the sample must
     have. All pairs must match (AND semantics).
+
+    ``facts_cells`` is a list of cells, where each cell is itself a list of
+    (field, term_id) pairs combined with AND. Cells are combined with OR so
+    multiple heatmap picks build a union cohort. ``facts_terms`` and
+    ``facts_cells`` together are AND'd with the sample filters.
     """
     where_clause, where_params = _filter_clauses(filters)
     base_params: list[object] = list(where_params)
+    extra_clauses: list[str] = []
 
-    if facts_terms:
-        for field_name, _ in facts_terms:
-            _validate_field(field_name)
-        clauses = []
-        for field_name, term_id in facts_terms:
-            clauses.append(
-                "EXISTS (SELECT 1 FROM facts f WHERE f.accession = s.accession "
-                "AND f.run_name = s.run_name AND f.field = ? AND f.term_id = ?)"
-            )
-            base_params.extend([field_name, term_id])
-        where_clause = where_clause + " AND " + " AND ".join(clauses)
+    term_clauses, term_params = _facts_terms_clauses(facts_terms)
+    extra_clauses.extend(term_clauses)
+    base_params.extend(term_params)
+
+    cell_clauses, cell_params = _facts_cells_clauses(facts_cells)
+    extra_clauses.extend(cell_clauses)
+    base_params.extend(cell_params)
+
+    if extra_clauses:
+        where_clause = where_clause + " AND " + " AND ".join(extra_clauses)
 
     sql = (
         "SELECT s.accession, s.organism_normalized, s.submission_year, s.project, "
-        "       s.title, s.source_system, s.in_chip_atlas, s.chip_atlas_genome "
+        "       s.title, s.source_system, s.in_chip_atlas, s.chip_atlas_genome, "
+        "       (SELECT MIN(sl.srx) FROM srx_links sl "
+        "          WHERE sl.accession = s.accession) AS srx, "
+        "       (SELECT COUNT(*) FROM srx_links sl "
+        "          WHERE sl.accession = s.accession)::INT AS srx_count "
         "FROM samples s "
         f"WHERE {where_clause} "
         "ORDER BY s.submission_year DESC, s.accession "
@@ -257,23 +310,52 @@ def cohort_count(
     con: duckdb.DuckDBPyConnection,
     filters: SampleFilters,
     facts_terms: list[tuple[str, str]] | None = None,
+    facts_cells: list[list[tuple[str, str]]] | None = None,
 ) -> int:
     where_clause, where_params = _filter_clauses(filters)
     base_params: list[object] = list(where_params)
-    if facts_terms:
-        for field_name, _ in facts_terms:
-            _validate_field(field_name)
-        clauses = []
-        for field_name, term_id in facts_terms:
-            clauses.append(
-                "EXISTS (SELECT 1 FROM facts f WHERE f.accession = s.accession "
-                "AND f.run_name = s.run_name AND f.field = ? AND f.term_id = ?)"
-            )
-            base_params.extend([field_name, term_id])
-        where_clause = where_clause + " AND " + " AND ".join(clauses)
+    extra_clauses: list[str] = []
+
+    term_clauses, term_params = _facts_terms_clauses(facts_terms)
+    extra_clauses.extend(term_clauses)
+    base_params.extend(term_params)
+
+    cell_clauses, cell_params = _facts_cells_clauses(facts_cells)
+    extra_clauses.extend(cell_clauses)
+    base_params.extend(cell_params)
+
+    if extra_clauses:
+        where_clause = where_clause + " AND " + " AND ".join(extra_clauses)
+
     sql = f"SELECT COUNT(DISTINCT s.accession) FROM samples s WHERE {where_clause}"
     row = con.execute(sql, base_params).fetchone()
     return int(row[0]) if row else 0
+
+
+def term_sample_count(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    term_id: str,
+    filters: SampleFilters,
+) -> tuple[int, int]:
+    """Return ``(sample_count, chip_atlas_count)`` for a single (field, term_id).
+
+    Counts are taken under the supplied ``SampleFilters``. Both values reflect
+    distinct ``s.accession``; the second narrows to ``s.in_chip_atlas``.
+    """
+    _validate_field(field_name)
+    where_clause, where_params = _filter_clauses(filters)
+    sql = (
+        "SELECT COUNT(DISTINCT s.accession), "
+        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) "
+        "FROM facts f "
+        "JOIN samples s ON s.accession = f.accession AND s.run_name = f.run_name "
+        f"WHERE f.field = ? AND f.term_id = ? AND {where_clause}"
+    )
+    row = con.execute(sql, [field_name, term_id, *where_params]).fetchone()
+    if row is None:
+        return (0, 0)
+    return (int(row[0] or 0), int(row[1] or 0))
 
 
 def cumulative_bubble_dataset(

@@ -9,6 +9,7 @@ from bsllmner_viewer.etl.build_facts import build_facts
 from bsllmner_viewer.etl.build_ontology import build_ontology
 from bsllmner_viewer.etl.build_runs import build_runs
 from bsllmner_viewer.etl.build_samples import build_samples
+from bsllmner_viewer.etl.build_srx_links import build_srx_links
 from bsllmner_viewer.etl.types import SourceSystemId
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -36,6 +37,10 @@ def _default_ontology_dir() -> Path:
 
 def _default_out_dir() -> Path:
     return _default_data_dir() / "parquet"
+
+
+def _default_sra_accessions_tab() -> Path:
+    return _default_data_dir() / "cache" / "SRA_Accessions.tab"
 
 
 SourceOption = Annotated[
@@ -112,6 +117,25 @@ def cmd_build_ontology(
     )
 
 
+@app.command("build-srx-links")
+def cmd_build_srx_links(
+    data_dir: Annotated[Path, typer.Option("--data-dir", "-d")] = _default_data_dir(),
+    out_dir: Annotated[Path, typer.Option("--out-dir", "-o")] = _default_out_dir(),
+    source_tab: Annotated[
+        Path, typer.Option("--source-tab", "-t")
+    ] = _default_sra_accessions_tab(),
+    samples_path: Annotated[Path | None, typer.Option("--samples-path")] = None,
+) -> None:
+    """NCBI SRA_Accessions.tab を読み srx_links.parquet を生成する。
+
+    `scripts/fetch_sra_accessions.py` で事前 download した cache を読む。
+    samples.parquet にある BioSample に紐づく SRX のみ採用する。
+    """
+    _setup_logging()
+    samples = samples_path if samples_path is not None else out_dir / "samples.parquet"
+    build_srx_links(source_tab, samples, out_dir / "srx_links.parquet")
+
+
 @app.command("build-all")
 def cmd_build_all(
     data_dir: Annotated[Path, typer.Option("--data-dir", "-d")] = _default_data_dir(),
@@ -119,15 +143,29 @@ def cmd_build_all(
         Path, typer.Option("--ontology-dir")
     ] = _default_ontology_dir(),
     out_dir: Annotated[Path, typer.Option("--out-dir", "-o")] = _default_out_dir(),
+    source_tab: Annotated[
+        Path, typer.Option("--source-tab", "-t")
+    ] = _default_sra_accessions_tab(),
     source_systems: SourceOption = None,
 ) -> None:
-    """runs → samples → facts → ontology を依存順で全部生成する。"""
+    """runs → samples → facts → ontology → srx-links を依存順で全部生成する。
+
+    `--source-tab` の cache が存在しない場合は srx-links のみ skip する。
+    """
     _setup_logging()
     source_tuple = _source_tuple(source_systems)
     build_runs(data_dir, out_dir / "runs.parquet", source_tuple)
     build_samples(data_dir, out_dir / "samples.parquet", source_tuple)
     build_facts(data_dir, out_dir / "facts.parquet", source_tuple)
     build_ontology(ontology_dir, out_dir / "ontology.parquet", None)
+    if source_tab.exists():
+        build_srx_links(source_tab, out_dir / "samples.parquet", out_dir / "srx_links.parquet")
+    else:
+        logging.getLogger(__name__).warning(
+            "skipping build-srx-links: %s does not exist "
+            "(run scripts/fetch_sra_accessions.py first)",
+            source_tab,
+        )
 
 
 if __name__ == "__main__":

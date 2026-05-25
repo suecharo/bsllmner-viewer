@@ -12,6 +12,7 @@ from bsllmner_viewer.lib.aggregation import (
     cohort_samples,
     cumulative_bubble_dataset,
     gap_heatmap_pivot,
+    term_sample_count,
     top_terms,
 )
 from bsllmner_viewer.lib.duckdb import get_conn
@@ -134,6 +135,89 @@ def test_cohort_count_matches_samples(aggregation_parquet_dir: Path) -> None:
         con, SampleFilters(), facts_terms=[("disease", "MONDO:1")]
     )
     assert n == 2
+
+
+def test_cohort_facts_cells_unions_distinct_cells(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # Two cells with disjoint sample sets: A1 (MONDO:1 + CHEBI:1) and
+    # A2 (MONDO:1 + CHEBI:2). Union ⇒ {A1, A2}.
+    df = cohort_samples(
+        con,
+        SampleFilters(),
+        facts_cells=[
+            [("disease", "MONDO:1"), ("drug", "CHEBI:1")],
+            [("disease", "MONDO:1"), ("drug", "CHEBI:2")],
+        ],
+    )
+    assert sorted(df["accession"].tolist()) == ["A1", "A2"]
+    assert cohort_count(
+        con,
+        SampleFilters(),
+        facts_cells=[
+            [("disease", "MONDO:1"), ("drug", "CHEBI:1")],
+            [("disease", "MONDO:1"), ("drug", "CHEBI:2")],
+        ],
+    ) == 2
+
+
+def test_cohort_facts_cells_ands_within_a_cell(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # Single cell requiring both disease=MONDO:1 AND drug=CHEBI:1 ⇒ only A1.
+    df = cohort_samples(
+        con,
+        SampleFilters(),
+        facts_cells=[[("disease", "MONDO:1"), ("drug", "CHEBI:1")]],
+    )
+    assert df["accession"].tolist() == ["A1"]
+
+
+def test_cohort_facts_cells_intersects_with_facts_terms(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # facts_cells union = {A1 (MONDO:1+CHEBI:1), A3 (MONDO:2)}.
+    # facts_terms forces drug=CHEBI:1 too, which only A1 satisfies.
+    df = cohort_samples(
+        con,
+        SampleFilters(),
+        facts_terms=[("drug", "CHEBI:1")],
+        facts_cells=[
+            [("disease", "MONDO:1")],
+            [("disease", "MONDO:2")],
+        ],
+    )
+    assert df["accession"].tolist() == ["A1"]
+
+
+def test_cohort_facts_cells_skips_empty_inner_cells(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # Empty inner cells must not collapse the OR into an empty parenthesis
+    # (which would be invalid SQL) and must not implicitly match everything.
+    df = cohort_samples(
+        con,
+        SampleFilters(),
+        facts_cells=[[], [("disease", "MONDO:2")], []],
+    )
+    assert df["accession"].tolist() == ["A3"]
+
+
+def test_cohort_facts_cells_all_empty_behaves_like_none(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # If every inner cell is empty there is no constraint to apply, so the
+    # caller gets the full sample set (matching `facts_cells=None`).
+    n_filtered = cohort_count(
+        con, SampleFilters(), facts_cells=[[], []]
+    )
+    n_unfiltered = cohort_count(con, SampleFilters())
+    assert n_filtered == n_unfiltered
 
 
 def test_bubble_dataset_groups_by_year_term_organism(
@@ -286,3 +370,51 @@ def test_cumulative_bubble_dataset_empty_when_no_data(
     assert df.empty
     assert "sample_count_cum" in df.columns
     assert "chip_atlas_count_cum" in df.columns
+
+
+# ---- term_sample_count ----
+
+
+def test_term_sample_count_counts_distinct_samples(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # MONDO:1 leaf has A1 + A2; both are in_chip_atlas.
+    assert term_sample_count(
+        con, "disease", "MONDO:1", SampleFilters()
+    ) == (2, 2)
+    # MONDO:2 has only A3 (Mus, not in chip-atlas).
+    assert term_sample_count(
+        con, "disease", "MONDO:2", SampleFilters()
+    ) == (1, 0)
+
+
+def test_term_sample_count_respects_filters(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    n_sample, n_chip = term_sample_count(
+        con,
+        "disease",
+        "MONDO:1",
+        SampleFilters(organism_normalized=["Mus musculus"]),
+    )
+    # Mus musculus filter drops A1/A2 (Homo) → 0 hits for MONDO:1.
+    assert (n_sample, n_chip) == (0, 0)
+
+
+def test_term_sample_count_unknown_term_returns_zero(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    assert term_sample_count(
+        con, "disease", "MONDO:99999", SampleFilters()
+    ) == (0, 0)
+
+
+def test_term_sample_count_rejects_unknown_field(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    with pytest.raises(ValueError, match="unknown field"):
+        term_sample_count(con, "title", "MONDO:1", SampleFilters())
