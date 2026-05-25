@@ -6,6 +6,7 @@ import pyarrow.parquet as pq
 
 from bsllmner_viewer.etl.load_input import iter_bs_entries
 from bsllmner_viewer.etl.load_select import iter_select_entries, read_run_metadata
+from bsllmner_viewer.etl.organism import normalize_organism
 from bsllmner_viewer.etl.sources import SOURCE_SYSTEMS, SourceSystem, iter_run_pairs
 from bsllmner_viewer.etl.types import BsInputEntry, SourceSystemId
 
@@ -15,6 +16,7 @@ _SCHEMA = pa.schema(
     [
         pa.field("accession", pa.string(), nullable=False),
         pa.field("organism", pa.string(), nullable=True),
+        pa.field("organism_normalized", pa.string(), nullable=True),
         pa.field("submission_year", pa.int32(), nullable=True),
         pa.field("project", pa.string(), nullable=True),
         pa.field("title", pa.string(), nullable=True),
@@ -46,9 +48,11 @@ def _make_row(
     run_name: str,
     bs: BsInputEntry | None,
 ) -> dict[str, object]:
+    raw_organism = bs.organism if bs else None
     return {
         "accession": accession,
-        "organism": (bs.organism if bs and bs.organism else source.organism),
+        "organism": raw_organism if raw_organism else source.organism,
+        "organism_normalized": normalize_organism(raw_organism) or source.organism,
         "submission_year": (
             bs.publication_date.year if bs and bs.publication_date else None
         ),
