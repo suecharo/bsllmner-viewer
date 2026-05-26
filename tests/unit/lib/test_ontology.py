@@ -9,6 +9,7 @@ from bsllmner_viewer.lib.ontology import (
     external_url,
     label,
     roots,
+    term_summaries,
     term_summary,
     terms_at_depth,
 )
@@ -110,6 +111,40 @@ def test_term_summary_missing(fixture_parquet_dir: Path) -> None:
     assert s.label is None
     assert s.ontology_source is None
     assert s.depth is None
+
+
+# ---- term_summaries ----
+
+
+def test_term_summaries_batch_matches_term_summary(
+    fixture_parquet_dir: Path,
+) -> None:
+    # Hits + miss in one batch should match what we'd get from N solo calls,
+    # and the dict must contain *every* requested ID (miss → all-None entry).
+    con = get_conn(parquet_dir=fixture_parquet_dir)
+    ids = ["T:1", "T:3", "DOES:NOT_EXIST"]
+    batch = term_summaries(con, ids)
+    assert set(batch) == set(ids)
+    for tid in ids:
+        assert batch[tid] == term_summary(con, tid)
+
+
+def test_term_summaries_empty_returns_empty(
+    fixture_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=fixture_parquet_dir)
+    assert term_summaries(con, []) == {}
+
+
+def test_term_summaries_dedupes_inputs(
+    fixture_parquet_dir: Path,
+) -> None:
+    # Duplicate IDs are common when collecting from multiple cells. The dict
+    # naturally collapses dupes, and the single row still carries the term.
+    con = get_conn(parquet_dir=fixture_parquet_dir)
+    batch = term_summaries(con, ["T:1", "T:1", "T:2"])
+    assert set(batch) == {"T:1", "T:2"}
+    assert batch["T:1"].label == "root"
 
 
 # ---- external_url ----

@@ -66,6 +66,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 "src/bsllmner_viewer/ui/**/*.py" = ["N999"]
 # typer の Option default に関数呼び出しを置くのは慣用句
 "src/bsllmner_viewer/etl/cli.py" = ["B008"]
+"scripts/**/*.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -89,6 +90,7 @@ module = [
     "bsllmner_viewer.etl.build_facts",
     "bsllmner_viewer.etl.build_ontology",
     "bsllmner_viewer.etl.build_srx_links",
+    "enrich_samples_with_srx",
 ]
 disallow_untyped_calls = false
 

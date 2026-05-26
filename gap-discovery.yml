@@ -1,0 +1,42 @@
+- generic [ref=e2]:
+  - list [ref=e10]:
+    - listitem [ref=e11]:
+      - link "Home" [ref=e13] [cursor=pointer]:
+        - /url: http://localhost:8000/
+        - paragraph [ref=e16]: Home
+    - listitem [ref=e17]:
+      - link "Gap Discovery" [ref=e19] [cursor=pointer]:
+        - /url: http://localhost:8000/Gap_Discovery
+        - paragraph [ref=e22]: Gap Discovery
+    - listitem [ref=e23]:
+      - link "Cohort" [ref=e25] [cursor=pointer]:
+        - /url: http://localhost:8000/Cohort
+        - paragraph [ref=e28]: Cohort
+    - listitem [ref=e29]:
+      - link "Gapminder" [ref=e31] [cursor=pointer]:
+        - /url: http://localhost:8000/Gapminder
+        - paragraph [ref=e34]: Gapminder
+    - listitem [ref=e35]:
+      - link "Curation" [ref=e37] [cursor=pointer]:
+        - /url: http://localhost:8000/Curation
+        - paragraph [ref=e40]: Curation
+  - generic [ref=e3]:
+    - banner [ref=e44]:
+      - generic [ref=e47]:
+        - button "Deploy" [ref=e49] [cursor=pointer]:
+          - generic [ref=e51]: Deploy
+        - button "Main menu" [ref=e53] [cursor=pointer]:
+          - img [ref=e54]
+    - alert [ref=e60]:
+      - generic [ref=e63]:
+        - generic [ref=e64]: "ImportError: cannot import name 'field_to_field_flow' from 'bsllmner_viewer.lib.aggregation' (/app/src/bsllmner_viewer/lib/aggregation.py)"
+        - generic [ref=e65]:
+          - generic [ref=e66]: "Traceback:"
+          - code [ref=e69]:
+            - generic [ref=e70]: File "/app/src/bsllmner_viewer/ui/pages/01_Gap_Discovery.py", line 9, in <module> from bsllmner_viewer.lib.aggregation import (
+        - generic [ref=e71]:
+          - button "Copy" [ref=e72] [cursor=pointer]
+          - link "Ask Google" [ref=e73] [cursor=pointer]:
+            - /url: https://www.google.com/search?q=ImportError%3A%20cannot%20import%20name%20'field_to_field_flow'%20from%20'bsllmner_viewer.lib.aggregation'%20(%2Fapp%2Fsrc%2Fbsllmner_viewer%2Flib%2Faggregation.py)
+          - link "Ask ChatGPT" [ref=e74] [cursor=pointer]:
+            - /url: https://chatgpt.com/?q=ImportError%3A%20cannot%20import%20name%20'field_to_field_flow'%20from%20'bsllmner_viewer.lib.aggregation'%20(%2Fapp%2Fsrc%2Fbsllmner_viewer%2Flib%2Faggregation.py)%0A%0AFile%20%22%2Fapp%2Fsrc%2Fbsllmner_viewer%2Fui%2Fpages%2F01_Gap_Discovery.py%22%2C%20line%209%2C%20in%20%3Cmodule%3E%0A%20%20%20%20from%20bsllmner_viewer.lib.aggregation%20import%20(

@@ -6,11 +6,18 @@ import plotly.express as px
 import streamlit as st
 
 from bsllmner_viewer.lib.aggregation import (
+    FIELD_TO_ONTOLOGY,
     VALID_FIELDS,
     SampleFilters,
     bubble_dataset,
+    can_roll_up,
+    concentration_over_time,
     cumulative_bubble_dataset,
+    cumulative_diversity,
+    momentum_dataset,
+    term_hierarchy_breakdown,
 )
+from bsllmner_viewer.lib.ontology import term_summaries
 from bsllmner_viewer.ui._conn import conn
 from bsllmner_viewer.ui._filters import sidebar_filters
 from bsllmner_viewer.ui._term_popover import render_term_popover
@@ -60,6 +67,36 @@ with col_f:
 with col_n:
     top_n = st.slider("Top N terms", min_value=5, max_value=50, value=15, step=5)
 
+
+def _depth_picker(field: str, key: str) -> int | None:
+    """Mirror of Gap Discovery's depth picker.
+
+    Hides itself for fields whose ontology has no usable hierarchy
+    (Cellosaurus / NCBI Gene) — depth roll-up is a no-op there.
+    """
+    if not can_roll_up(field):
+        st.caption(
+            f"`{field}` rolls up against no usable hierarchy "
+            "(Cellosaurus / NCBI Gene) — depth picker disabled."
+        )
+        return None
+    source = FIELD_TO_ONTOLOGY[field]
+    choices = ["leaf", "0", "1", "2", "3", "4", "5"]
+    chosen = st.selectbox(
+        f"Roll-up depth ({source})",
+        options=choices,
+        index=0,
+        key=key,
+        help=(
+            "Roll each leaf term up to its ancestor at the chosen depth. "
+            "`leaf` keeps the original term."
+        ),
+    )
+    return None if chosen == "leaf" else int(chosen)
+
+
+roll_up_depth = _depth_picker(field_name, "gapminder_depth_picker")
+
 col_m, col_y, col_s = st.columns(3)
 with col_m:
     mode = st.radio(
@@ -95,6 +132,7 @@ def _load(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    roll_up_depth: int | None,
 ) -> pd.DataFrame:
     f = SampleFilters(
         organism_normalized=list(organism),
@@ -104,11 +142,15 @@ def _load(
         in_chip_atlas=in_chip_atlas,
     )
     if mode == "Cumulative":
-        df = cumulative_bubble_dataset(conn(), field_name, f, top_n)
+        df = cumulative_bubble_dataset(
+            conn(), field_name, f, top_n, roll_up_depth=roll_up_depth
+        )
         df["count"] = df["sample_count_cum"]
         df["chip_count"] = df["chip_atlas_count_cum"]
     else:
-        df = bubble_dataset(conn(), field_name, f, top_n)
+        df = bubble_dataset(
+            conn(), field_name, f, top_n, roll_up_depth=roll_up_depth
+        )
         df["count"] = df["sample_count"]
         df["chip_count"] = df["chip_atlas_count"]
     return df
@@ -123,6 +165,7 @@ df = _load(
     filters.submission_year_min,
     filters.submission_year_max,
     filters.in_chip_atlas,
+    roll_up_depth,
 )
 
 if df.empty:
@@ -155,7 +198,7 @@ df["x_pos"] = df["label"].map(label_to_x)
 # rebuilds the figure DOM with the new range / scale / category order rather
 # than reusing the previous frame.
 chart_state_key = (
-    f"{mode}|{field_name}|{top_n}|{y_log}|{size_log}|"
+    f"{mode}|{field_name}|{top_n}|{roll_up_depth}|{y_log}|{size_log}|"
     f"{tuple(filters.organism_normalized)}|{tuple(filters.source_system)}|"
     f"{filters.submission_year_min}|{filters.submission_year_max}|"
     f"{filters.in_chip_atlas}"
@@ -170,7 +213,31 @@ chip_axis_title = (
     else "ChIP-Atlas (per-year)"
 )
 
-tab_bubble, tab_line = st.tabs(["Bubble", "Trajectory"])
+(
+    tab_bubble,
+    tab_line,
+    tab_race,
+    tab_heatmap,
+    tab_comp,
+    tab_slope,
+    tab_momentum,
+    tab_diversity,
+    tab_concentration,
+    tab_treemap,
+) = st.tabs(
+    [
+        "Bubble",
+        "Trajectory",
+        "Rank race",
+        "Heatmap",
+        "Composition",
+        "Slope",
+        "Momentum",
+        "Diversity",
+        "Concentration",
+        "Treemap",
+    ]
+)
 
 with tab_bubble:
     bubble_df = df[df["count"] > 0].copy()
@@ -282,6 +349,703 @@ with tab_line:
         f"Mode: {mode.lower()}."
     )
 
+# Rank race / Heatmap / Composition operate at (year × term) granularity —
+# organism is summed out so each term has a single trace. Done in pandas so
+# every toggle (mode / log) still triggers a fresh render.
+agg_df = (
+    df.groupby(["submission_year", "term_id", "label"], as_index=False)
+    .agg(count=("count", "sum"), chip_count=("chip_count", "sum"))
+)
+agg_df["submission_year"] = agg_df["submission_year"].astype(int)
+# Order terms by their overall maximum count across the timeline — used as a
+# stable y/category order for the rank race + heatmap + composition tabs.
+overall_order = (
+    agg_df.groupby("label")["count"]
+    .max()
+    .sort_values(ascending=False)
+    .index.tolist()
+)
+
+with tab_race:
+    if agg_df["count"].sum() == 0:
+        st.info(
+            "All counts are zero for the current selection. "
+            "Switch *Aggregation* to Cumulative or relax the filters."
+        )
+    else:
+        race_df = agg_df.copy()
+        race_df["rank"] = race_df.groupby("submission_year")["count"].rank(
+            ascending=False, method="first"
+        )
+        max_x = float(race_df["count"].max()) or 1.0
+        fig_race = px.bar(
+            race_df,
+            x="count",
+            y="label",
+            orientation="h",
+            color="label",
+            animation_frame="submission_year",
+            animation_group="label",
+            hover_data={
+                "term_id": True,
+                "rank": True,
+                "chip_count": True,
+                "label": False,
+                "submission_year": False,
+            },
+            range_x=(
+                [0.8, max_x * 1.4] if y_log else [0, max_x * 1.05]
+            ),
+            log_x=y_log,
+            labels={
+                "count": count_axis_title,
+                "label": field_name,
+                "chip_count": chip_axis_title,
+            },
+        )
+        # Pin category order by overall importance so bars don't fully
+        # reshuffle every frame — Plotly's animation can't sort per frame,
+        # so a stable axis with shrinking/growing bars conveys the race best.
+        fig_race.update_yaxes(
+            categoryorder="array",
+            categoryarray=list(reversed(overall_order)),
+        )
+        fig_race.update_layout(
+            height=max(400, 28 * len(overall_order)),
+            showlegend=False,
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        if fig_race.layout.updatemenus:
+            fig_race.layout.updatemenus[0]["buttons"][0]["args"][1]["frame"][
+                "duration"
+            ] = 800
+            fig_race.layout.updatemenus[0]["buttons"][0]["args"][1][
+                "transition"
+            ]["duration"] = 400
+        st.plotly_chart(
+            fig_race, width="stretch", key=f"race_{chart_state_key}"
+        )
+        st.caption(
+            f"Bars are ordered by overall {mode.lower()} count across the "
+            "timeline; their length shrinks/grows per frame. Numeric rank "
+            "shown in the hover tooltip."
+        )
+
+with tab_heatmap:
+    if agg_df["count"].sum() == 0:
+        st.info("All counts are zero for the current selection.")
+    else:
+        pivot = (
+            agg_df.pivot_table(
+                index="label",
+                columns="submission_year",
+                values="count",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            .reindex(overall_order)
+            .sort_index(axis=1)
+        )
+        # Log color compresses the dynamic range so 16K vs 100 still both
+        # show variation; +1 avoids -inf for empty cells.
+        z_values = np.log10(pivot.to_numpy() + 1) if y_log else pivot.to_numpy()
+        color_label = (
+            "log10(count + 1)" if y_log else count_axis_title
+        )
+        fig_heat = px.imshow(
+            z_values,
+            x=[int(c) for c in pivot.columns],
+            y=list(pivot.index),
+            aspect="auto",
+            color_continuous_scale="Blues",
+            labels={
+                "x": "submission_year",
+                "y": field_name,
+                "color": color_label,
+            },
+        )
+        fig_heat.update_layout(
+            height=max(400, 28 * len(pivot.index)),
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_heat, width="stretch", key=f"heatmap_{chart_state_key}"
+        )
+        st.caption(
+            f"Static year × term heatmap. Color = "
+            f"{'log10(count + 1)' if y_log else mode.lower() + ' count'}. "
+            "Row order = overall importance descending."
+        )
+
+with tab_comp:
+    if agg_df["count"].sum() == 0:
+        st.info("All counts are zero for the current selection.")
+    else:
+        normalize = st.toggle(
+            "100% stacked (share, not absolute)",
+            value=False,
+            key=f"comp_norm_{chart_state_key}",
+            help=(
+                "On: each year's bars sum to 100% (share). "
+                "Off: stacked area shows absolute counts."
+            ),
+        )
+        comp_df = agg_df.sort_values(["submission_year", "label"])
+        fig_comp = px.area(
+            comp_df,
+            x="submission_year",
+            y="count",
+            color="label",
+            groupnorm="percent" if normalize else None,
+            category_orders={"label": overall_order},
+            hover_data={"term_id": True, "chip_count": True},
+            labels={
+                "submission_year": "Submission year",
+                "count": (
+                    "Share (%)" if normalize else count_axis_title
+                ),
+                "label": field_name,
+                "chip_count": chip_axis_title,
+            },
+        )
+        if normalize:
+            fig_comp.update_yaxes(range=[0, 100], ticksuffix="%")
+        elif y_log:
+            # Log on a stacked area is misleading (areas don't compose under
+            # log); only apply it on the absolute-mode linear stack when the
+            # user explicitly opted in by leaving Y log on.
+            fig_comp.update_yaxes(type="log")
+        fig_comp.update_layout(
+            height=600,
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_comp,
+            width="stretch",
+            key=f"comp_{chart_state_key}_{normalize}",
+        )
+        st.caption(
+            "Composition view: how the top terms' share of total "
+            "submissions evolves across years. "
+            f"{'100% stacked.' if normalize else 'Absolute stacked area.'}"
+        )
+
+with tab_slope:
+    # A5: 2-year slope graph. Picks two years (default min, max of the
+    # current dataset) and draws one line per top-N term, exposing the slope
+    # itself as the visual signal — steep up = breakout, steep down = decline.
+    if agg_df["count"].sum() == 0:
+        st.info("All counts are zero for the current selection.")
+    else:
+        available_years = sorted(agg_df["submission_year"].astype(int).unique())
+        if len(available_years) < 2:
+            st.info(
+                "Slope graph needs at least 2 years of data; current dataset "
+                f"has only {len(available_years)}."
+            )
+        else:
+            col_y1, col_y2 = st.columns(2)
+            with col_y1:
+                year_start = st.selectbox(
+                    "Year (start)",
+                    options=available_years,
+                    index=0,
+                    key=f"slope_y1_{chart_state_key}",
+                )
+            with col_y2:
+                year_end = st.selectbox(
+                    "Year (end)",
+                    options=available_years,
+                    index=len(available_years) - 1,
+                    key=f"slope_y2_{chart_state_key}",
+                )
+            if year_start == year_end:
+                st.info("Start and end years must differ.")
+            else:
+                lo, hi = sorted((int(year_start), int(year_end)))
+                slope_df = (
+                    agg_df[agg_df["submission_year"].isin([lo, hi])]
+                    .pivot_table(
+                        index=["term_id", "label"],
+                        columns="submission_year",
+                        values="count",
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+                    .reset_index()
+                )
+                slope_long = (
+                    slope_df.melt(
+                        id_vars=["term_id", "label"],
+                        value_vars=[lo, hi],
+                        var_name="submission_year",
+                        value_name="count",
+                    )
+                    .assign(submission_year=lambda d: d["submission_year"].astype(int))
+                )
+                slope_df["delta"] = slope_df[hi] - slope_df[lo]
+                # Annotate delta in hover so the slope numbers are explicit.
+                slope_long = slope_long.merge(
+                    slope_df[["term_id", "delta"]], on="term_id"
+                )
+                max_y = float(slope_long["count"].max()) or 1.0
+                fig_slope = px.line(
+                    slope_long,
+                    x="submission_year",
+                    y="count",
+                    color="label",
+                    markers=True,
+                    hover_data={"term_id": True, "delta": True},
+                    log_y=y_log,
+                    range_y=(
+                        [0.8, max_y * 1.4] if y_log else [0, max_y * 1.1]
+                    ),
+                    labels={
+                        "submission_year": "Year",
+                        "count": count_axis_title,
+                        "label": field_name,
+                        "delta": f"Δ ({hi} − {lo})",
+                    },
+                )
+                fig_slope.update_xaxes(
+                    tickmode="array",
+                    tickvals=[lo, hi],
+                    ticktext=[str(lo), str(hi)],
+                )
+                fig_slope.update_layout(
+                    height=max(400, 24 * len(slope_df)),
+                    modebar={"remove": ["fullscreen", "togglefullscreen"]},
+                )
+                st.plotly_chart(
+                    fig_slope,
+                    width="stretch",
+                    key=f"slope_{chart_state_key}_{lo}_{hi}",
+                )
+                st.caption(
+                    f"Slope = count change between {lo} and {hi}. "
+                    "Steep up/down = recent breakout / decline."
+                )
+
+with tab_momentum:
+    # A6: per-term momentum scatter. X = absolute level, Y = year-over-year
+    # delta, size = cumulative volume. The latest-year slice exposes "right-
+    # upper hot zone" terms (high count + still growing) vs "high count but
+    # decaying" (right-lower) at a glance.
+    @st.cache_data(show_spinner="computing momentum…")
+    def _load_momentum(
+        field_name: str,
+        top_n: int,
+        organism: tuple[str, ...],
+        source: tuple[str, ...],
+        year_min: int | None,
+        year_max: int | None,
+        in_chip_atlas: bool | None,
+        roll_up_depth: int | None,
+    ) -> pd.DataFrame:
+        f = SampleFilters(
+            organism_normalized=list(organism),
+            source_system=list(source),
+            submission_year_min=year_min,
+            submission_year_max=year_max,
+            in_chip_atlas=in_chip_atlas,
+        )
+        return momentum_dataset(
+            conn(), field_name, f, top_n=top_n, roll_up_depth=roll_up_depth
+        )
+
+    mom_df = _load_momentum(
+        field_name,
+        top_n,
+        tuple(filters.organism_normalized),
+        tuple(filters.source_system),
+        filters.submission_year_min,
+        filters.submission_year_max,
+        filters.in_chip_atlas,
+        roll_up_depth,
+    )
+    if mom_df.empty:
+        st.info("No momentum data for the current filters.")
+    else:
+        years_mom = sorted(mom_df["submission_year"].astype(int).unique())
+        latest = int(years_mom[-1])
+        focus_year = st.selectbox(
+            "Year (snapshot)",
+            options=years_mom,
+            index=len(years_mom) - 1,
+            key=f"momentum_year_{chart_state_key}",
+            help=(
+                "Each dot is a term in this year: X = level, Y = year-over-"
+                "year delta. Right-up = growing, right-down = receding."
+            ),
+        )
+        snap = mom_df[mom_df["submission_year"].astype(int) == int(focus_year)].copy()
+        # Drop fully-zero rows (no level AND no movement) — they crowd the
+        # origin without telling us anything.
+        snap = snap[~((snap["count_abs"] == 0) & (snap["count_delta"] == 0))]
+        if snap.empty:
+            st.info(
+                f"No term has any activity in {focus_year}. "
+                "Try a later year."
+            )
+        else:
+            if size_log:
+                snap["bubble_size"] = np.log10(
+                    snap["count_cum"].clip(lower=1)
+                ) + 1
+            else:
+                snap["bubble_size"] = snap["count_cum"].clip(lower=0)
+            fig_mom = px.scatter(
+                snap,
+                x="count_abs",
+                y="count_delta",
+                size="bubble_size",
+                size_max=32,
+                color="label",
+                hover_name="label",
+                hover_data={
+                    "term_id": True,
+                    "count_abs": True,
+                    "count_delta": True,
+                    "count_cum": True,
+                    "bubble_size": False,
+                    "label": False,
+                },
+                log_x=y_log,
+                labels={
+                    "count_abs": f"{focus_year} count (level)",
+                    "count_delta": (
+                        f"Year-over-year Δ ({focus_year} − {int(focus_year) - 1})"
+                    ),
+                    "count_cum": "Cumulative",
+                    "label": field_name,
+                },
+            )
+            # A reference line at delta=0 separates growing from receding.
+            fig_mom.add_hline(
+                y=0, line_dash="dot", line_color="grey", opacity=0.7
+            )
+            fig_mom.update_layout(
+                height=600,
+                modebar={"remove": ["fullscreen", "togglefullscreen"]},
+            )
+            st.plotly_chart(
+                fig_mom,
+                width="stretch",
+                key=f"momentum_{chart_state_key}_{focus_year}",
+            )
+            st.caption(
+                f"Momentum snapshot at {focus_year}. Bubble size = "
+                f"{'log10(cumulative + 1)' if size_log else 'cumulative'} "
+                "samples."
+            )
+
+with tab_diversity:
+    # A8: cumulative unique-term curve. Plateau = ontology saturation
+    # (research re-uses the same set), steady climb = new terms keep
+    # appearing.
+    div_group = st.radio(
+        "Split by",
+        options=["Overall", "Organism", "Source system"],
+        index=0,
+        horizontal=True,
+        key=f"div_group_{chart_state_key}",
+    )
+    group_by_arg: str | None = {
+        "Overall": None,
+        "Organism": "organism_normalized",
+        "Source system": "source_system",
+    }[div_group]
+
+    @st.cache_data(show_spinner="counting unique terms…")
+    def _load_diversity(
+        field_name: str,
+        group_by: str | None,
+        organism: tuple[str, ...],
+        source: tuple[str, ...],
+        year_min: int | None,
+        year_max: int | None,
+        in_chip_atlas: bool | None,
+        roll_up_depth: int | None,
+    ) -> pd.DataFrame:
+        f = SampleFilters(
+            organism_normalized=list(organism),
+            source_system=list(source),
+            submission_year_min=year_min,
+            submission_year_max=year_max,
+            in_chip_atlas=in_chip_atlas,
+        )
+        return cumulative_diversity(
+            conn(), field_name, f, group_by=group_by, roll_up_depth=roll_up_depth
+        )
+
+    div_df = _load_diversity(
+        field_name,
+        group_by_arg,
+        tuple(filters.organism_normalized),
+        tuple(filters.source_system),
+        filters.submission_year_min,
+        filters.submission_year_max,
+        filters.in_chip_atlas,
+        roll_up_depth,
+    )
+    if div_df.empty:
+        st.info("No diversity data for the current filters.")
+    else:
+        fig_div = px.line(
+            div_df,
+            x="submission_year",
+            y="cum_unique_terms",
+            color="group_value",
+            markers=True,
+            hover_data={"unique_terms": True},
+            log_y=y_log,
+            labels={
+                "submission_year": "Year",
+                "cum_unique_terms": "Cumulative unique terms",
+                "unique_terms": "New that year",
+                "group_value": "Group",
+            },
+        )
+        fig_div.update_layout(
+            height=520,
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_div,
+            width="stretch",
+            key=f"div_{chart_state_key}_{div_group}",
+        )
+        st.caption(
+            "Cumulative unique terms over time (running union). "
+            "Plateau = ontology saturation, steady climb = new terms still "
+            "arriving."
+        )
+
+with tab_concentration:
+    # A9: per-year Gini + Shannon (max-normalized) on the per-term sample
+    # distribution. High Gini / low Shannon = research concentrates on a
+    # few hot terms; low Gini / high Shannon = work is spread out.
+    @st.cache_data(show_spinner="computing concentration…")
+    def _load_concentration(
+        field_name: str,
+        organism: tuple[str, ...],
+        source: tuple[str, ...],
+        year_min: int | None,
+        year_max: int | None,
+        in_chip_atlas: bool | None,
+        roll_up_depth: int | None,
+    ) -> pd.DataFrame:
+        f = SampleFilters(
+            organism_normalized=list(organism),
+            source_system=list(source),
+            submission_year_min=year_min,
+            submission_year_max=year_max,
+            in_chip_atlas=in_chip_atlas,
+        )
+        return concentration_over_time(
+            conn(), field_name, f, roll_up_depth=roll_up_depth
+        )
+
+    conc_df = _load_concentration(
+        field_name,
+        tuple(filters.organism_normalized),
+        tuple(filters.source_system),
+        filters.submission_year_min,
+        filters.submission_year_max,
+        filters.in_chip_atlas,
+        roll_up_depth,
+    )
+    if conc_df.empty:
+        st.info("No concentration data for the current filters.")
+    else:
+        conc_long = conc_df.melt(
+            id_vars=["submission_year", "n_terms", "total_samples"],
+            value_vars=["gini", "shannon"],
+            var_name="metric",
+            value_name="value",
+        )
+        fig_conc = px.line(
+            conc_long,
+            x="submission_year",
+            y="value",
+            color="metric",
+            markers=True,
+            hover_data={"n_terms": True, "total_samples": True},
+            labels={
+                "submission_year": "Year",
+                "value": "Concentration / Entropy",
+                "metric": "Metric",
+                "n_terms": "Terms that year",
+                "total_samples": "Samples that year",
+            },
+        )
+        fig_conc.update_yaxes(range=[0, 1])
+        fig_conc.update_layout(
+            height=520,
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_conc,
+            width="stretch",
+            key=f"conc_{chart_state_key}",
+        )
+        st.caption(
+            "Gini → 1 = concentrated; Gini → 0 = uniform. "
+            "Shannon (max-normalized) is the inverse signal: 0 = single "
+            "dominant term, 1 = perfectly uniform."
+        )
+
+with tab_treemap:
+    # A11: ontology subtree treemap, animated by year. Roll-up-capable
+    # fields only — the rest get a caption explaining why.
+    if not can_roll_up(field_name):
+        st.info(
+            f"Treemap needs a usable ontology hierarchy. `{field_name}` "
+            "(Cellosaurus / NCBI Gene) has none — pick disease / cell_type "
+            "/ tissue / drug instead."
+        )
+    else:
+        tree_depth = st.slider(
+            "Treemap max depth (from ontology root)",
+            min_value=1,
+            max_value=4,
+            value=2,
+            key=f"tree_depth_{chart_state_key}",
+            help=(
+                "Higher = more cells, finer hierarchy. Plotly treemap can "
+                "stall above ~500 boxes; keep it small."
+            ),
+        )
+
+        @st.cache_data(show_spinner="building hierarchy…")
+        def _load_hierarchy(
+            field_name: str,
+            depth: int,
+            organism: tuple[str, ...],
+            source: tuple[str, ...],
+            year_min: int | None,
+            year_max: int | None,
+            in_chip_atlas: bool | None,
+        ) -> pd.DataFrame:
+            f = SampleFilters(
+                organism_normalized=list(organism),
+                source_system=list(source),
+                submission_year_min=year_min,
+                submission_year_max=year_max,
+                in_chip_atlas=in_chip_atlas,
+            )
+            return term_hierarchy_breakdown(
+                conn(),
+                field_name,
+                f,
+                max_depth=depth,
+                by_year=True,
+            )
+
+        hier_df = _load_hierarchy(
+            field_name,
+            tree_depth,
+            tuple(filters.organism_normalized),
+            tuple(filters.source_system),
+            filters.submission_year_min,
+            filters.submission_year_max,
+            filters.in_chip_atlas,
+        )
+        if hier_df.empty:
+            st.info(
+                "No subtree terms have samples under the current filters."
+            )
+        else:
+            hier_df = hier_df.copy()
+            hier_df["chip_atlas_ratio"] = np.where(
+                hier_df["sample_count"] > 0,
+                hier_df["chip_atlas_count"] / hier_df["sample_count"],
+                0.0,
+            )
+            # Plotly treemap needs every parent_term_id to appear as a
+            # term_id too (or be empty). Inject synthetic root rows for any
+            # parent that's missing from the data so the tree closes.
+            missing_parents = set(hier_df["parent_term_id"]) - set(
+                hier_df["term_id"]
+            ) - {""}
+            if missing_parents:
+                pad_rows = [
+                    {
+                        "submission_year": year,
+                        "term_id": p,
+                        "parent_term_id": "",
+                        "label": p,
+                        "depth": 0,
+                        "sample_count": 0,
+                        "chip_atlas_count": 0,
+                        "chip_atlas_ratio": 0.0,
+                    }
+                    for year in sorted(
+                        hier_df["submission_year"].astype(int).unique()
+                    )
+                    for p in missing_parents
+                ]
+                hier_df = pd.concat(
+                    [hier_df, pd.DataFrame(pad_rows)], ignore_index=True
+                )
+            # plotly.express.treemap does NOT support animation_frame (it
+            # would render once and freeze on frame 1). Use a year picker
+            # to switch the static snapshot instead.
+            tree_years = sorted(
+                hier_df["submission_year"].astype(int).unique().tolist()
+            )
+            tree_year = st.selectbox(
+                "Year (snapshot)",
+                options=tree_years,
+                index=len(tree_years) - 1,
+                key=f"tree_year_{chart_state_key}",
+                help=(
+                    "Treemap shows the hierarchy at this year only. "
+                    "Plotly Express treemap doesn't animate, so step "
+                    "through years to see growth."
+                ),
+            )
+            year_slice = hier_df[
+                hier_df["submission_year"].astype(int) == int(tree_year)
+            ]
+            if year_slice.empty:
+                st.info(f"No subtree data for {tree_year}.")
+            else:
+                fig_tree = px.treemap(
+                    year_slice,
+                    ids="term_id",
+                    parents="parent_term_id",
+                    names="label",
+                    values="sample_count",
+                    color="chip_atlas_ratio",
+                    color_continuous_scale="RdYlGn",
+                    range_color=(0.0, 1.0),
+                    hover_data={
+                        "term_id": True,
+                        "depth": True,
+                        "chip_atlas_count": True,
+                        "chip_atlas_ratio": ":.2f",
+                    },
+                    labels={
+                        "chip_atlas_ratio": "ChIP-Atlas %",
+                        "chip_atlas_count": "ChIP-Atlas samples",
+                    },
+                )
+                fig_tree.update_layout(
+                    height=700,
+                    modebar={"remove": ["fullscreen", "togglefullscreen"]},
+                )
+                st.plotly_chart(
+                    fig_tree,
+                    width="stretch",
+                    key=f"tree_{chart_state_key}_{tree_depth}_{tree_year}",
+                )
+                st.caption(
+                    f"Ontology subtree at {tree_year}. Size = BioSample "
+                    "count; color = ChIP-Atlas coverage ratio (red = "
+                    "uncovered, green = covered)."
+                )
+
 # Show the Top N (term_id, label) selection from the underlying dataset and
 # expose each one as a term-info popover. The bubble chart itself can't be
 # wired to a click handler, so this section is the navigation hand-off.
@@ -289,5 +1053,9 @@ st.subheader(f"Top terms for `{field_name}`")
 term_label_map = (
     df.drop_duplicates("term_id").set_index("term_id")["label"].to_dict()
 )
+top_term_summaries = term_summaries(con, list(term_label_map.keys()))
 for term_id, lbl in term_label_map.items():
-    render_term_popover(con, field_name, term_id, lbl, filters)
+    render_term_popover(
+        con, field_name, term_id, lbl, filters,
+        summary=top_term_summaries.get(term_id),
+    )

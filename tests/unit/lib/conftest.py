@@ -85,6 +85,8 @@ _SAMPLES_SCHEMA = pa.schema(
         pa.field("run_name", pa.string(), nullable=False),
         pa.field("in_chip_atlas", pa.bool_(), nullable=False),
         pa.field("chip_atlas_genome", pa.string(), nullable=True),
+        pa.field("srx_first", pa.string(), nullable=True),
+        pa.field("srx_count", pa.int32(), nullable=False),
     ]
 )
 
@@ -134,6 +136,49 @@ _FACTS_ROWS = [
     # A5: disease=MONDO:11 (leaf, child of MONDO:1)
     ("A5", "run1", "disease", "lung cancer", "MONDO:11",
      "lung neoplasm", True, 1.0, "MONDO", "ok"),
+    # --- Quality-meta rows: exercise mapping_failed / extract_failed paths for
+    # Home F3/F4 and Curation D1/D2/D3 without changing the term_id
+    # distribution that other tests assert against.
+    # tissue mapping_failed on A1 + A4: same raw value "weird tissue X"
+    # appears twice, so D3 surfaces a frequency > 1.
+    ("A1", "run1", "tissue", "weird tissue X", None, None, None, None,
+     None, "mapping_failed"),
+    ("A4", "run1", "tissue", "weird tissue X", None, None, None, None,
+     None, "mapping_failed"),
+    # tissue extract_failed on A2 (value=None means LLM didn't extract).
+    ("A2", "run1", "tissue", None, None, None, None, None, None,
+     "extract_failed"),
+    # drug mapping_failed on A3 (raw value but unmapped).
+    ("A3", "run2", "drug", "herbal compound", None, None, None, None,
+     None, "mapping_failed"),
+]
+
+
+_SRX_LINKS_SCHEMA = pa.schema(
+    [
+        pa.field("srx", pa.string(), nullable=False),
+        pa.field("accession", pa.string(), nullable=False),
+        pa.field("bioproject", pa.string(), nullable=True),
+        pa.field("sra_study", pa.string(), nullable=True),
+        pa.field("sra_sample", pa.string(), nullable=True),
+        pa.field("status", pa.string(), nullable=False),
+    ]
+)
+
+# Per-BioSample SRX topology used by per-SRX expansion + cohort_samples tests:
+#   A1 -> 2 SRX (multi)
+#   A2 -> 1 SRX
+#   A3 -> 1 SRX (in_chip_atlas=False BS)
+#   A4 -> 0 SRX  (covers "BS without any SRX" path; INNER JOIN drops it)
+#   A5 -> 3 SRX (multi, with mixed status to exercise status-passthrough)
+_SRX_ROWS = [
+    ("SRX1", "A1", "PRJ1", "SRP1", "SRS1", "live"),
+    ("SRX2", "A1", "PRJ1", "SRP1", "SRS1", "live"),
+    ("SRX3", "A2", "PRJ1", "SRP1", "SRS2", "live"),
+    ("SRX4", "A3", "PRJ2", "SRP2", "SRS3", "live"),
+    ("SRX5", "A5", "PRJ1", "SRP1", "SRS5", "live"),
+    ("SRX6", "A5", "PRJ1", "SRP1", "SRS5", "suppressed"),
+    ("SRX7", "A5", "PRJ1", "SRP1", "SRS5", "live"),
 ]
 
 
@@ -141,13 +186,29 @@ _FACTS_ROWS = [
 def aggregation_parquet_dir(fixture_parquet_dir: Path) -> Path:
     pdir = fixture_parquet_dir
 
-    samples = pa.Table.from_pylist(
-        [
-            dict(zip([f.name for f in _SAMPLES_SCHEMA], r, strict=True))
-            for r in _SAMPLES_ROWS
-        ],
-        schema=_SAMPLES_SCHEMA,
-    )
+    # Aggregate _SRX_ROWS per accession so the inline scalar columns on
+    # samples.parquet (`srx_first` = MIN(srx), `srx_count` = COUNT) stay
+    # consistent with the standalone srx_links.parquet fixture.
+    srx_first_by_acc: dict[str, str] = {}
+    srx_count_by_acc: dict[str, int] = {}
+    for srx, acc, _bp, _study, _sample, _status in _SRX_ROWS:
+        srx_count_by_acc[acc] = srx_count_by_acc.get(acc, 0) + 1
+        existing = srx_first_by_acc.get(acc)
+        if existing is None or srx < existing:
+            srx_first_by_acc[acc] = srx
+
+    base_fields = [
+        f.name for f in _SAMPLES_SCHEMA
+        if f.name not in {"srx_first", "srx_count"}
+    ]
+    sample_rows: list[dict[str, object]] = []
+    for row in _SAMPLES_ROWS:
+        d: dict[str, object] = dict(zip(base_fields, row, strict=True))
+        acc = str(d["accession"])
+        d["srx_first"] = srx_first_by_acc.get(acc)
+        d["srx_count"] = srx_count_by_acc.get(acc, 0)
+        sample_rows.append(d)
+    samples = pa.Table.from_pylist(sample_rows, schema=_SAMPLES_SCHEMA)
     pq.write_table(samples, pdir / "samples.parquet")
 
     facts = pa.Table.from_pylist(
@@ -158,5 +219,14 @@ def aggregation_parquet_dir(fixture_parquet_dir: Path) -> Path:
         schema=_FACTS_SCHEMA,
     )
     pq.write_table(facts, pdir / "facts.parquet")
+
+    srx_links = pa.Table.from_pylist(
+        [
+            dict(zip([f.name for f in _SRX_LINKS_SCHEMA], r, strict=True))
+            for r in _SRX_ROWS
+        ],
+        schema=_SRX_LINKS_SCHEMA,
+    )
+    pq.write_table(srx_links, pdir / "srx_links.parquet")
 
     return pdir

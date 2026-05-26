@@ -12,6 +12,11 @@ from bsllmner_viewer.etl.types import BsInputEntry, SourceSystemId
 
 logger = logging.getLogger(__name__)
 
+# SRX-per-BioSample counts live inline on samples.parquet so the Cohort
+# page's main table (1 row = 1 BioSample, "first SRX + N more") needs no
+# extra DuckDB query. The per-SRX deep-link table still drills into the
+# long-form `srx_links.parquet` via accession lookup — that path is faster
+# than UNNESTing a LIST<STRUCT> on samples (measured ~5x).
 _SCHEMA = pa.schema(
     [
         pa.field("accession", pa.string(), nullable=False),
@@ -24,6 +29,8 @@ _SCHEMA = pa.schema(
         pa.field("run_name", pa.string(), nullable=False),
         pa.field("in_chip_atlas", pa.bool_(), nullable=False),
         pa.field("chip_atlas_genome", pa.string(), nullable=True),
+        pa.field("srx_first", pa.string(), nullable=True),
+        pa.field("srx_count", pa.int32(), nullable=False),
     ]
 )
 
@@ -61,6 +68,11 @@ def _make_row(
         "run_name": run_name,
         "in_chip_atlas": source.in_chip_atlas,
         "chip_atlas_genome": source.chip_atlas_genome,
+        # SRX columns start empty — `build-srx-links` enriches samples.parquet
+        # in-place after the SRA_Accessions scan, populating these from the
+        # accession ↔ SRX mapping.
+        "srx_first": None,
+        "srx_count": 0,
     }
 
 
@@ -91,6 +103,12 @@ def build_samples(
                 )
 
     table = pa.Table.from_pylist(rows, schema=_SCHEMA)
+    # Pre-sort by the Cohort page's primary key (submission_year DESC, accession)
+    # so DuckDB can serve `cohort_samples`'s `ORDER BY ... LIMIT 10000` straight
+    # from the parquet without an extra sort pass.
+    table = table.sort_by(
+        [("submission_year", "descending"), ("accession", "ascending")]
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_path)
     logger.info("wrote %d sample rows to %s", len(rows), out_path)

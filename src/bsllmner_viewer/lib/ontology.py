@@ -109,6 +109,43 @@ def term_summary(
     )
 
 
+def term_summaries(
+    con: duckdb.DuckDBPyConnection,
+    term_ids: list[str],
+) -> dict[str, TermSummary]:
+    """Batch version of ``term_summary`` for a list of term IDs.
+
+    UI pages render many term popovers per rerun (Top N axis terms on Gap
+    Discovery, all cohort constraints on Cohort, etc.). Calling
+    ``term_summary`` per term forces an ontology.parquet scan each time —
+    1 SQL with ``UNNEST(?::VARCHAR[])`` collapses that into a single scan.
+
+    Term IDs absent from ``ontology.parquet`` (e.g. NCBI Gene IDs) still
+    appear in the returned dict with all fields = None, matching the
+    fallback behaviour of ``term_summary``.
+    """
+    if not term_ids:
+        return {}
+    rows = con.execute(
+        "SELECT term_id, label, ontology_source, depth FROM ontology "
+        "WHERE term_id IN (SELECT UNNEST(?::VARCHAR[])) "
+        "  AND parent_term_id = term_id",
+        [term_ids],
+    ).fetchall()
+    out: dict[str, TermSummary] = {
+        tid: TermSummary(term_id=tid, label=None, ontology_source=None, depth=None)
+        for tid in term_ids
+    }
+    for tid, label_value, source_value, depth_value in rows:
+        out[tid] = TermSummary(
+            term_id=tid,
+            label=label_value,
+            ontology_source=source_value,
+            depth=int(depth_value) if depth_value is not None else None,
+        )
+    return out
+
+
 # Per-prefix URL builders. Each (site, builder) entry returns the user-facing
 # label and the absolute URL for the term. New ontologies extend this table —
 # `external_url` itself is just a dispatch over the term_id prefix.

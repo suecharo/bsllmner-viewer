@@ -26,6 +26,8 @@ def render_term_popover(
     term_id: str,
     label: str | None,
     filters: SampleFilters,
+    *,
+    summary: TermSummary | None = None,
 ) -> None:
     """Render one term as an ``st.popover`` button.
 
@@ -34,8 +36,14 @@ def render_term_popover(
     ``ontology.parquet``), the BioSample count under the current filters, and
     an external link to the ontology's official term page (if the prefix is
     known).
+
+    Pass a pre-fetched ``summary`` to avoid the per-term ``ontology.parquet``
+    lookup — pages that render many popovers (Gap Discovery axis terms,
+    cohort constraints) batch-fetch via ``term_summaries`` so a click rerun
+    isn't N independent queries.
     """
-    summary = term_summary(con, term_id)
+    if summary is None:
+        summary = term_summary(con, term_id)
     shown_label = summary.label or label or term_id
     with st.popover(f"ℹ {shown_label}", help=f"{field} · {term_id}"):
         _render_body(con, field, term_id, shown_label, summary, filters)

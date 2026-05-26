@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 VALID_FIELDS: Final[tuple[str, ...]] = (
@@ -275,6 +276,12 @@ def cohort_samples(
     (field, term_id) pairs combined with AND. Cells are combined with OR so
     multiple heatmap picks build a union cohort. ``facts_terms`` and
     ``facts_cells`` together are AND'd with the sample filters.
+
+    The returned DataFrame carries ``srx`` (first SRX) and ``srx_count``
+    inline so the main BioSample table is served from a single samples-only
+    SELECT — no extra JOIN against ``srx_links`` (Cohort rerenders on every
+    sidebar change and a JOIN would dominate latency). The per-SRX deep-link
+    drill-down passes the resulting accession list to ``cohort_srx_links``.
     """
     where_clause, where_params = _filter_clauses(filters)
     base_params: list[object] = list(where_params)
@@ -292,18 +299,111 @@ def cohort_samples(
         where_clause = where_clause + " AND " + " AND ".join(extra_clauses)
 
     sql = (
-        "SELECT s.accession, s.organism_normalized, s.submission_year, s.project, "
-        "       s.title, s.source_system, s.in_chip_atlas, s.chip_atlas_genome, "
-        "       (SELECT MIN(sl.srx) FROM srx_links sl "
-        "          WHERE sl.accession = s.accession) AS srx, "
-        "       (SELECT COUNT(*) FROM srx_links sl "
-        "          WHERE sl.accession = s.accession)::INT AS srx_count "
+        "SELECT s.accession, s.organism_normalized, s.submission_year, "
+        "       s.title, s.source_system, s.in_chip_atlas, "
+        "       s.srx_first AS srx, s.srx_count "
         "FROM samples s "
         f"WHERE {where_clause} "
         "ORDER BY s.submission_year DESC, s.accession "
         "LIMIT ?"
     )
     return con.execute(sql, [*base_params, limit]).fetchdf()
+
+
+_SRX_LINKS_COLS: Final[tuple[str, ...]] = (
+    "accession",
+    "srx",
+    "bioproject",
+    "sra_study",
+    "sra_sample",
+    "status",
+    "chip_atlas_genome",
+)
+
+
+def cohort_srx_links(
+    con: duckdb.DuckDBPyConnection,
+    accessions: list[str],
+    limit: int = 500,
+) -> pd.DataFrame:
+    """Return per-SRX rows for the given BioSamples (1 row per SRX).
+
+    Joins ``srx_links`` to ``samples`` so each per-SRX row carries
+    ``chip_atlas_genome`` (needed to build ChIP-Atlas deep links) without the
+    caller having to plumb it. Pre-filtering on the cohort's accession list
+    keeps the scan bounded.
+
+    Columns: ``accession`` / ``srx`` / ``bioproject`` / ``sra_study`` /
+    ``sra_sample`` / ``status`` / ``chip_atlas_genome``.
+
+    ``limit`` caps the SRX row count (default 500) so the UI never has to
+    render an unbounded table.
+    """
+    if not accessions:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in _SRX_LINKS_COLS})
+    sql = (
+        "SELECT sl.accession, sl.srx, sl.bioproject, sl.sra_study, "
+        "       sl.sra_sample, sl.status, s.chip_atlas_genome "
+        "FROM srx_links sl "
+        "JOIN samples s ON s.accession = sl.accession "
+        "WHERE sl.accession IN (SELECT UNNEST(?::VARCHAR[])) "
+        "ORDER BY sl.accession, sl.srx "
+        "LIMIT ?"
+    )
+    return con.execute(sql, [accessions, limit]).fetchdf()
+
+
+_FACTS_COLS_OUT: Final[tuple[str, ...]] = ("accession", "field", "value")
+
+
+def cohort_facts_columns(
+    con: duckdb.DuckDBPyConnection,
+    accessions: list[str],
+    fields: list[str],
+) -> pd.DataFrame:
+    """Return per-(accession, field) ontology labels for cohort table columns.
+
+    Aggregates each (accession, field) into a single string of
+    ``"label (term_id)"`` segments, deduplicated by ``term_id`` and sorted
+    by the rendered string, joined with ``", "``. Used to render
+    per-ontology-field columns in the Cohort drill-down table.
+
+    When ``label`` is NULL the segment falls back to ``term_id`` alone
+    (avoiding the redundant ``"MONDO:99 (MONDO:99)"`` output).
+
+    Aggregation is run-agnostic: facts from every run for a given accession
+    are union-merged, so the user sees every term the BioSample was
+    annotated with regardless of which run produced it. Multiple labels for
+    the same ``term_id`` across runs collapse to ``MIN(display)`` so the
+    output stays deterministic.
+
+    Returns long-form ``(accession, field, value)``. The UI pivots to one
+    column per field and merges into the main cohort table on ``accession``.
+
+    Empty when either ``accessions`` or ``fields`` is empty.
+    """
+    if not accessions or not fields:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in _FACTS_COLS_OUT})
+    for f in fields:
+        _validate_field(f)
+    fields_ph = ",".join(["?"] * len(fields))
+    sql = (
+        "WITH per_term AS ("
+        "  SELECT f.accession, f.field, f.term_id, "
+        "         MIN(COALESCE(f.label || ' (' || f.term_id || ')', "
+        "                      f.term_id)) AS display "
+        "  FROM facts f "
+        "  WHERE f.accession IN (SELECT UNNEST(?::VARCHAR[])) "
+        f"    AND f.field IN ({fields_ph}) "
+        "    AND f.term_id IS NOT NULL "
+        "  GROUP BY f.accession, f.field, f.term_id"
+        ") "
+        "SELECT accession, field, "
+        "       STRING_AGG(display, ', ' ORDER BY display) AS value "
+        "FROM per_term "
+        "GROUP BY accession, field"
+    )
+    return con.execute(sql, [accessions, *fields]).fetchdf()
 
 
 def cohort_count(
@@ -363,6 +463,7 @@ def cumulative_bubble_dataset(
     field_name: str,
     filters: SampleFilters,
     top_n: int = 15,
+    roll_up_depth: int | None = None,
 ) -> pd.DataFrame:
     """Same as ``bubble_dataset`` but with per-year counts cumulatively summed.
 
@@ -371,8 +472,12 @@ def cumulative_bubble_dataset(
     where no rows exist, then ``cumsum`` is applied. Cumulative columns are
     ``sample_count_cum`` / ``chip_atlas_count_cum``; the original
     ``sample_count`` / ``chip_atlas_count`` per-year values are kept.
+
+    ``roll_up_depth`` matches ``bubble_dataset`` — leaves are replaced with the
+    ancestor at the requested depth in ``FIELD_TO_ONTOLOGY[field_name]`` before
+    the per-year aggregation runs.
     """
-    df = bubble_dataset(con, field_name, filters, top_n)
+    df = bubble_dataset(con, field_name, filters, top_n, roll_up_depth)
     cum_columns = ["sample_count_cum", "chip_atlas_count_cum"]
     if df.empty:
         for col in cum_columns:
@@ -411,14 +516,21 @@ def bubble_dataset(
     field_name: str,
     filters: SampleFilters,
     top_n: int = 30,
+    roll_up_depth: int | None = None,
 ) -> pd.DataFrame:
     """Aggregate (year, term) → sample count, with chip-atlas overlay.
 
     Returns columns: ``submission_year``, ``term_id``, ``label``,
     ``sample_count``, ``chip_atlas_count``, ``organism_normalized``.
+
+    ``roll_up_depth``: when set, replace each leaf term with its
+    ``MIN(parent_term_id)`` ancestor at that depth in
+    ``FIELD_TO_ONTOLOGY[field_name]`` (same semantics as ``gap_heatmap_pivot``
+    and ``top_terms``). Fields outside ``FIELD_TO_ONTOLOGY`` keep the leaf
+    term — the picker should be hidden by the UI in that case.
     """
     _validate_field(field_name)
-    top_pairs = top_terms(con, field_name, filters, top_n)
+    top_pairs = top_terms(con, field_name, filters, top_n, roll_up_depth)
     if not top_pairs:
         return pd.DataFrame(
             columns=[
@@ -431,19 +543,732 @@ def bubble_dataset(
             ]
         )
     where_clause, where_params = _filter_clauses(filters)
+    axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
     term_ids = [t for t, _ in top_pairs]
     term_ph = ",".join(["?"] * len(term_ids))
     sql = (
-        "SELECT s.submission_year, f.term_id, ANY_VALUE(f.label) AS label, "
+        f"WITH fx AS ({axis_sql}) "
+        "SELECT s.submission_year, fx.term_id, ANY_VALUE(fx.label) AS label, "
         "       s.organism_normalized, "
         "       COUNT(DISTINCT s.accession) AS sample_count, "
         "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) AS chip_atlas_count "
-        "FROM facts f "
-        "JOIN samples s ON s.accession = f.accession AND s.run_name = f.run_name "
-        f"WHERE f.field = ? AND f.term_id IN ({term_ph}) "
+        "FROM fx "
+        "JOIN samples s ON s.accession = fx.accession AND s.run_name = fx.run_name "
+        f"WHERE fx.term_id IN ({term_ph}) "
         f"  AND s.submission_year IS NOT NULL AND {where_clause} "
-        "GROUP BY s.submission_year, f.term_id, s.organism_normalized "
-        "ORDER BY s.submission_year, f.term_id"
+        "GROUP BY s.submission_year, fx.term_id, s.organism_normalized "
+        "ORDER BY s.submission_year, fx.term_id"
     )
-    params = [field_name, *term_ids, *where_params]
+    params: list[object] = [*axis_params, *term_ids, *where_params]
     return con.execute(sql, params).fetchdf()
+
+
+def cohort_breakdown(
+    con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+    facts_terms: list[tuple[str, str]] | None = None,
+    facts_cells: list[list[tuple[str, str]]] | None = None,
+) -> pd.DataFrame:
+    """(submission_year, organism_normalized, source_system) → sample_count.
+
+    Powers the cohort page's 3-up mini histograms (year / organism / source).
+    Aggregates the whole cohort in SQL — the UI's 10K table cap does not
+    truncate the histograms.
+    """
+    where_clause, where_params = _filter_clauses(filters)
+    base_params: list[object] = list(where_params)
+    extra_clauses: list[str] = []
+
+    term_clauses, term_params = _facts_terms_clauses(facts_terms)
+    extra_clauses.extend(term_clauses)
+    base_params.extend(term_params)
+
+    cell_clauses, cell_params = _facts_cells_clauses(facts_cells)
+    extra_clauses.extend(cell_clauses)
+    base_params.extend(cell_params)
+
+    if extra_clauses:
+        where_clause = where_clause + " AND " + " AND ".join(extra_clauses)
+
+    sql = (
+        "SELECT s.submission_year, s.organism_normalized, s.source_system, "
+        "       COUNT(DISTINCT s.accession) AS sample_count, "
+        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) "
+        "       AS chip_atlas_count "
+        "FROM samples s "
+        f"WHERE {where_clause} "
+        "GROUP BY s.submission_year, s.organism_normalized, s.source_system"
+    )
+    return con.execute(sql, base_params).fetchdf()
+
+
+# ---- Home dashboard helpers (filter-free, full-dataset aggregates) ----
+
+
+def samples_by_year_source(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """(submission_year, source_system) → sample_count over the full dataset.
+
+    Used by Home F1. Skips NULL submission_year rows (samples missing input
+    metadata).
+    """
+    return con.execute(
+        "SELECT submission_year, source_system, "
+        "       COUNT(DISTINCT accession) AS sample_count "
+        "FROM samples "
+        "WHERE submission_year IS NOT NULL "
+        "GROUP BY submission_year, source_system "
+        "ORDER BY submission_year, source_system"
+    ).fetchdf()
+
+
+def samples_by_organism(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """``organism_normalized`` → sample_count for the Home F2 donut."""
+    return con.execute(
+        "SELECT COALESCE(organism_normalized, '(unknown)') "
+        "       AS organism_normalized, "
+        "       COUNT(DISTINCT accession) AS sample_count "
+        "FROM samples "
+        "GROUP BY 1 "
+        "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def samples_by_source(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """``source_system`` → sample_count for the Home F2 donut."""
+    return con.execute(
+        "SELECT source_system, COUNT(DISTINCT accession) AS sample_count "
+        "FROM samples "
+        "GROUP BY source_system "
+        "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def field_facts_status(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """(field, extract_status) → fact row count over the full facts table.
+
+    Used by Home F3 (per-field 100% stacked bar) and F4 (overall metric
+    cards). Caller derives ratios in pandas.
+    """
+    return con.execute(
+        "SELECT field, extract_status, COUNT(*) AS n "
+        "FROM facts "
+        "GROUP BY field, extract_status "
+        "ORDER BY field, extract_status"
+    ).fetchdf()
+
+
+def top_terms_overall(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    top_n: int,
+) -> pd.DataFrame:
+    """Top N (term_id, label, sample_count) for a field, ignoring filters.
+
+    Used by Home F5 (Pareto bar). Returns leaf-level only — depth roll-up is
+    out of scope for the dashboard top-list.
+    """
+    _validate_field(field_name)
+    return con.execute(
+        "SELECT f.term_id, ANY_VALUE(f.label) AS label, "
+        "       COUNT(DISTINCT f.accession) AS sample_count "
+        "FROM facts f "
+        "WHERE f.field = ? AND f.term_id IS NOT NULL "
+        "GROUP BY f.term_id "
+        "ORDER BY sample_count DESC "
+        "LIMIT ?",
+        [field_name, top_n],
+    ).fetchdf()
+
+
+# ---- Curation page helpers ----
+
+
+def mapping_status_matrix(
+    con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+) -> pd.DataFrame:
+    """(field, source_system, extract_status) → fact row count, filter-aware.
+
+    Used by Curation D1. Joins facts to samples so sidebar filters propagate.
+    """
+    where_clause, where_params = _filter_clauses(filters)
+    return con.execute(
+        "SELECT f.field, s.source_system, f.extract_status, COUNT(*) AS n "
+        "FROM facts f "
+        "JOIN samples s ON s.accession = f.accession "
+        "  AND s.run_name = f.run_name "
+        f"WHERE {where_clause} "
+        "GROUP BY f.field, s.source_system, f.extract_status "
+        "ORDER BY f.field, s.source_system, f.extract_status",
+        where_params,
+    ).fetchdf()
+
+
+def mapping_status_over_time(
+    con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+) -> pd.DataFrame:
+    """(field, submission_year, extract_status) → fact row count, filter-aware.
+
+    Used by Curation D2. NULL submission_year is dropped so the line chart's x
+    axis stays contiguous.
+    """
+    where_clause, where_params = _filter_clauses(filters)
+    return con.execute(
+        "SELECT f.field, s.submission_year, f.extract_status, COUNT(*) AS n "
+        "FROM facts f "
+        "JOIN samples s ON s.accession = f.accession "
+        "  AND s.run_name = f.run_name "
+        f"WHERE s.submission_year IS NOT NULL AND {where_clause} "
+        "GROUP BY f.field, s.submission_year, f.extract_status "
+        "ORDER BY f.field, s.submission_year, f.extract_status",
+        where_params,
+    ).fetchdf()
+
+
+def top_unmapped_values(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    top_n: int,
+    filters: SampleFilters,
+) -> pd.DataFrame:
+    """Top N raw ``value`` strings whose mapping failed (term_id IS NULL).
+
+    Used by Curation D3. Returns ``(value, n, sample_count)``: ``n`` is the
+    fact-row count and ``sample_count`` the distinct BioSample count — they
+    diverge for array-typed fields (drug / knockout_gene / ...).
+    """
+    _validate_field(field_name)
+    where_clause, where_params = _filter_clauses(filters)
+    return con.execute(
+        "SELECT f.value, COUNT(*) AS n, "
+        "       COUNT(DISTINCT f.accession) AS sample_count "
+        "FROM facts f "
+        "JOIN samples s ON s.accession = f.accession "
+        "  AND s.run_name = f.run_name "
+        "WHERE f.field = ? AND f.term_id IS NULL AND f.value IS NOT NULL "
+        f"  AND {where_clause} "
+        "GROUP BY f.value "
+        "ORDER BY n DESC "
+        "LIMIT ?",
+        [field_name, *where_params, top_n],
+    ).fetchdf()
+
+
+def raw_value_term_flow(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    top_n: int,
+    filters: SampleFilters,
+    min_count: int = 1,
+) -> pd.DataFrame:
+    """Top N (value, term_id) pairs whose mapping succeeded — Sankey input.
+
+    Used by Curation D5. ``extract_status = 'ok'`` plus ``term_id IS NOT NULL``
+    guarantees we only see resolved mappings; ``value IS NOT NULL`` keeps the
+    left side meaningful. ``min_count`` is a frequency floor used to declutter
+    the Sankey for high-cardinality fields.
+    """
+    _validate_field(field_name)
+    where_clause, where_params = _filter_clauses(filters)
+    return con.execute(
+        "SELECT f.value, f.term_id, ANY_VALUE(f.label) AS label, "
+        "       COUNT(*) AS n, "
+        "       COUNT(DISTINCT f.accession) AS sample_count "
+        "FROM facts f "
+        "JOIN samples s ON s.accession = f.accession "
+        "  AND s.run_name = f.run_name "
+        "WHERE f.field = ? AND f.extract_status = 'ok' "
+        "  AND f.term_id IS NOT NULL AND f.value IS NOT NULL "
+        f"  AND {where_clause} "
+        "GROUP BY f.value, f.term_id "
+        "HAVING COUNT(*) >= ? "
+        "ORDER BY n DESC "
+        "LIMIT ?",
+        [field_name, *where_params, min_count, top_n],
+    ).fetchdf()
+
+
+# ---- Gapminder Tier 2 (Momentum / Diversity / Concentration / Hierarchy) ----
+
+
+def momentum_dataset(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    top_n: int = 15,
+    roll_up_depth: int | None = None,
+) -> pd.DataFrame:
+    """Year-over-year momentum data for the Gapminder A6 scatter.
+
+    Aggregates ``bubble_dataset`` over organism so each row is a single
+    ``(term_id, year)``, then reindexes every term against the contiguous
+    year range and computes per-year ``count_abs`` (level), ``count_delta``
+    (year-over-year diff; the first year matches ``count_abs``), and
+    ``count_cum`` (running total).
+    """
+    df = bubble_dataset(con, field_name, filters, top_n, roll_up_depth)
+    cols = [
+        "term_id",
+        "label",
+        "submission_year",
+        "count_abs",
+        "count_delta",
+        "count_cum",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    agg = (
+        df.groupby(["term_id", "submission_year"], as_index=False)
+        .agg(count_abs=("sample_count", "sum"), label=("label", "first"))
+    )
+    agg["submission_year"] = agg["submission_year"].astype(int)
+    years = sorted(agg["submission_year"].unique())
+    full_years = list(range(min(years), max(years) + 1))
+
+    label_by_term = (
+        agg.drop_duplicates("term_id").set_index("term_id")["label"].to_dict()
+    )
+
+    parts: list[pd.DataFrame] = []
+    for term_id, g in agg.groupby("term_id", sort=False):
+        series = (
+            g.set_index("submission_year")["count_abs"]
+            .reindex(full_years, fill_value=0)
+            .astype(int)
+        )
+        # diff() returns NaN for the first year; treat the first year's
+        # delta as the level itself so a newly-appearing term doesn't render
+        # with a NaN momentum (which Plotly silently drops from a scatter).
+        delta = series.diff().fillna(series).astype(int)
+        cum = series.cumsum().astype(int)
+        parts.append(
+            pd.DataFrame(
+                {
+                    "term_id": term_id,
+                    "label": label_by_term.get(term_id, term_id),
+                    "submission_year": full_years,
+                    "count_abs": series.to_numpy(),
+                    "count_delta": delta.to_numpy(),
+                    "count_cum": cum.to_numpy(),
+                }
+            )
+        )
+    return pd.concat(parts, ignore_index=True)[cols]
+
+
+def cumulative_diversity(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    group_by: str | None = None,
+    roll_up_depth: int | None = None,
+) -> pd.DataFrame:
+    """Per-year and cumulative unique-term counts — Gapminder A8.
+
+    ``group_by`` selects the partition column: ``None`` for the overall
+    dataset (``group_value = '(overall)'``), ``'organism_normalized'`` or
+    ``'source_system'`` to split by that dimension. The cumulative count is
+    the size of the running union of ``term_id`` sets and is computed in
+    Python because SQL's ``COUNT(DISTINCT)`` doesn't expand into a running
+    union without window-level lateral joins that DuckDB doesn't expose.
+    """
+    _validate_field(field_name)
+    allowed_groups = {None, "organism_normalized", "source_system"}
+    if group_by not in allowed_groups:
+        raise ValueError(f"unknown group_by: {group_by!r}")
+
+    where_clause, where_params = _filter_clauses(filters)
+    axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
+    group_expr = (
+        f"COALESCE(s.{group_by}, '(unknown)')"
+        if group_by
+        else "'(overall)'"
+    )
+    sql = (
+        f"WITH fx AS ({axis_sql}) "
+        f"SELECT s.submission_year, {group_expr} AS group_value, fx.term_id "
+        "FROM fx "
+        "JOIN samples s ON s.accession = fx.accession "
+        "  AND s.run_name = fx.run_name "
+        f"WHERE s.submission_year IS NOT NULL AND {where_clause}"
+    )
+    raw = con.execute(sql, [*axis_params, *where_params]).fetchdf()
+    cols = [
+        "submission_year",
+        "group_value",
+        "unique_terms",
+        "cum_unique_terms",
+    ]
+    if raw.empty:
+        return pd.DataFrame(columns=cols)
+    raw["submission_year"] = raw["submission_year"].astype(int)
+
+    parts: list[pd.DataFrame] = []
+    for grp, g in raw.groupby("group_value", sort=False):
+        years = sorted(g["submission_year"].unique())
+        full_years = list(range(min(years), max(years) + 1))
+        by_year_terms: dict[int, set[str]] = {
+            int(y): set(g.loc[g["submission_year"] == y, "term_id"].dropna())
+            for y in years
+        }
+        seen: set[str] = set()
+        rows: list[dict[str, object]] = []
+        for y in full_years:
+            new_terms = by_year_terms.get(y, set())
+            seen |= new_terms
+            rows.append(
+                {
+                    "submission_year": y,
+                    "group_value": grp,
+                    "unique_terms": len(new_terms),
+                    "cum_unique_terms": len(seen),
+                }
+            )
+        parts.append(pd.DataFrame(rows))
+    return pd.concat(parts, ignore_index=True)[cols]
+
+
+def _gini(counts: np.ndarray) -> float:
+    """Population Gini coefficient. Returns 0 for empty / all-zero input."""
+    if counts.size == 0:
+        return 0.0
+    sorted_c = np.sort(counts)
+    total = float(sorted_c.sum())
+    if total <= 0.0:
+        return 0.0
+    n = sorted_c.size
+    indices = np.arange(1, n + 1, dtype=float)
+    return float(
+        (2.0 * float((indices * sorted_c).sum()) - (n + 1) * total)
+        / (n * total)
+    )
+
+
+def _shannon_normalized(counts: np.ndarray) -> float:
+    """Shannon entropy divided by log(n_terms). Returns 0 for n<=1 or empty."""
+    if counts.size <= 1:
+        return 0.0
+    total = float(counts.sum())
+    if total <= 0.0:
+        return 0.0
+    p = counts / total
+    nz = p[p > 0]
+    if nz.size <= 1:
+        return 0.0
+    h = float(-(nz * np.log(nz)).sum())
+    return h / float(np.log(counts.size))
+
+
+def concentration_over_time(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    roll_up_depth: int | None = None,
+) -> pd.DataFrame:
+    """Per-year Gini + max-normalized Shannon entropy — Gapminder A9.
+
+    Both metrics live on [0, 1] so the UI can plot them on a single axis.
+    Gini = population formula on per-term sample counts.
+    Shannon = entropy / log(n_terms); ``0`` when there's only one term.
+    """
+    _validate_field(field_name)
+    where_clause, where_params = _filter_clauses(filters)
+    axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
+    sql = (
+        f"WITH fx AS ({axis_sql}) "
+        "SELECT s.submission_year, fx.term_id, "
+        "       COUNT(DISTINCT s.accession) AS sample_count "
+        "FROM fx "
+        "JOIN samples s ON s.accession = fx.accession "
+        "  AND s.run_name = fx.run_name "
+        f"WHERE s.submission_year IS NOT NULL AND {where_clause} "
+        "GROUP BY s.submission_year, fx.term_id"
+    )
+    raw = con.execute(sql, [*axis_params, *where_params]).fetchdf()
+    cols = [
+        "submission_year",
+        "n_terms",
+        "total_samples",
+        "gini",
+        "shannon",
+    ]
+    if raw.empty:
+        return pd.DataFrame(columns=cols)
+    raw["submission_year"] = raw["submission_year"].astype(int)
+
+    rows: list[dict[str, object]] = []
+    for year, g in raw.groupby("submission_year", sort=True):
+        counts = g["sample_count"].astype(float).to_numpy()
+        rows.append(
+            {
+                "submission_year": int(year),
+                "n_terms": int(counts.size),
+                "total_samples": int(counts.sum()),
+                "gini": _gini(counts),
+                "shannon": _shannon_normalized(counts),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def term_hierarchy_breakdown(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    root_term: str | None = None,
+    max_depth: int = 2,
+    roll_up_depth: int | None = None,
+    by_year: bool = False,
+) -> pd.DataFrame:
+    """Ontology-subtree sample counts for Sunburst (B3) / Treemap (A11).
+
+    Returns rows enriched with the direct ``parent_term_id`` (closest
+    ancestor in the subtree, i.e. ``parent.depth = term.depth - 1``;
+    ``MIN(parent_term_id)`` ties for DAG ambiguity) and ``depth`` from
+    ``ontology.parquet``. Only terms with ``sample_count > 0`` are returned
+    so empty branches don't bloat the visual. Non-hierarchical fields
+    (Cellosaurus / NCBIGene) return an empty DataFrame.
+    """
+    _validate_field(field_name)
+    base_cols = [
+        "term_id",
+        "parent_term_id",
+        "label",
+        "depth",
+        "sample_count",
+        "chip_atlas_count",
+    ]
+    cols = (["submission_year", *base_cols]) if by_year else base_cols
+    if not can_roll_up(field_name):
+        return pd.DataFrame(columns=cols)
+    source = FIELD_TO_ONTOLOGY[field_name]
+
+    if root_term is not None:
+        root_row = con.execute(
+            "SELECT depth FROM ontology WHERE term_id = ? "
+            "  AND parent_term_id = term_id AND ontology_source = ? LIMIT 1",
+            [root_term, source],
+        ).fetchone()
+        if root_row is None:
+            return pd.DataFrame(columns=cols)
+        root_depth = int(root_row[0])
+        absolute_max = root_depth + max_depth
+        subtree_sql = (
+            "SELECT DISTINCT o_self.term_id, o_self.label, o_self.depth "
+            "FROM ontology o_anc "
+            "JOIN ontology o_self "
+            "  ON o_self.term_id = o_anc.term_id "
+            "  AND o_self.parent_term_id = o_self.term_id "
+            "  AND o_self.ontology_source = o_anc.ontology_source "
+            "WHERE o_anc.ontology_source = ? AND o_anc.parent_term_id = ? "
+            "  AND o_self.depth <= ?"
+        )
+        subtree = con.execute(
+            subtree_sql, [source, root_term, absolute_max]
+        ).fetchdf()
+    else:
+        subtree = con.execute(
+            "SELECT term_id, label, depth FROM ontology "
+            "WHERE ontology_source = ? AND parent_term_id = term_id "
+            "  AND depth <= ?",
+            [source, max_depth],
+        ).fetchdf()
+    if subtree.empty:
+        return pd.DataFrame(columns=cols)
+    subtree["depth"] = subtree["depth"].astype(int)
+
+    term_ids: list[str] = subtree["term_id"].tolist()
+    depth_by_term: dict[str, int] = dict(
+        zip(subtree["term_id"], subtree["depth"], strict=False)
+    )
+    label_by_term: dict[str, str] = dict(
+        zip(
+            subtree["term_id"],
+            subtree["label"].fillna(subtree["term_id"]).astype(str),
+            strict=False,
+        )
+    )
+
+    # Direct parent = ancestor with parent.depth = child.depth - 1. The
+    # ontology table holds the transitive closure, so we filter back in
+    # Python rather than SELF-JOIN'ing the closure (cheaper for the typical
+    # subtree size of <few hundred terms).
+    term_ph = ",".join(["?"] * len(term_ids))
+    edges = con.execute(
+        f"SELECT term_id, parent_term_id FROM ontology "
+        f"WHERE ontology_source = ? AND parent_term_id != term_id "
+        f"  AND term_id IN ({term_ph})",
+        [source, *term_ids],
+    ).fetchdf()
+    direct_parent: dict[str, str] = {}
+    if not edges.empty:
+        for child_id, group in edges.groupby("term_id"):
+            child_depth = depth_by_term.get(str(child_id))
+            if child_depth is None:
+                continue
+            candidates = [
+                str(p)
+                for p in group["parent_term_id"]
+                if depth_by_term.get(str(p)) == child_depth - 1
+            ]
+            if candidates:
+                direct_parent[str(child_id)] = min(candidates)
+
+    where_clause, where_params = _filter_clauses(filters)
+    axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
+    if by_year:
+        agg_sql = (
+            f"WITH fx AS ({axis_sql}) "
+            "SELECT fx.term_id, s.submission_year, "
+            "       COUNT(DISTINCT s.accession) AS sample_count, "
+            "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas "
+            "         THEN s.accession END) AS chip_atlas_count "
+            "FROM fx "
+            "JOIN samples s ON s.accession = fx.accession "
+            "  AND s.run_name = fx.run_name "
+            f"WHERE fx.term_id IN ({term_ph}) "
+            f"  AND s.submission_year IS NOT NULL AND {where_clause} "
+            "GROUP BY fx.term_id, s.submission_year"
+        )
+    else:
+        agg_sql = (
+            f"WITH fx AS ({axis_sql}) "
+            "SELECT fx.term_id, "
+            "       COUNT(DISTINCT s.accession) AS sample_count, "
+            "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas "
+            "         THEN s.accession END) AS chip_atlas_count "
+            "FROM fx "
+            "JOIN samples s ON s.accession = fx.accession "
+            "  AND s.run_name = fx.run_name "
+            f"WHERE fx.term_id IN ({term_ph}) AND {where_clause} "
+            "GROUP BY fx.term_id"
+        )
+    counts = con.execute(
+        agg_sql, [*axis_params, *term_ids, *where_params]
+    ).fetchdf()
+    if counts.empty:
+        return pd.DataFrame(columns=cols)
+
+    counts["parent_term_id"] = counts["term_id"].map(
+        lambda t: direct_parent.get(str(t), "")
+    )
+    counts["label"] = counts["term_id"].map(
+        lambda t: label_by_term.get(str(t), str(t))
+    )
+    counts["depth"] = (
+        counts["term_id"].map(lambda t: depth_by_term.get(str(t), 0)).astype(int)
+    )
+    counts["sample_count"] = counts["sample_count"].astype(int)
+    counts["chip_atlas_count"] = counts["chip_atlas_count"].astype(int)
+    if by_year:
+        counts["submission_year"] = counts["submission_year"].astype(int)
+    return counts[cols].reset_index(drop=True)
+
+
+def field_to_field_flow(
+    con: duckdb.DuckDBPyConnection,
+    x_field: str,
+    y_field: str,
+    filters: SampleFilters,
+    top_n_x: int = 15,
+    top_n_y: int = 15,
+    x_roll_up_depth: int | None = None,
+    y_roll_up_depth: int | None = None,
+) -> pd.DataFrame:
+    """Long-form (x, y) flow rows for Gap Discovery B4 Sankey.
+
+    Delegates to ``gap_heatmap_pivot`` (same SQL, same roll-up semantics)
+    and keeps only positive-count cells so Plotly Sankey doesn't draw
+    zero-thickness links.
+    """
+    df = gap_heatmap_pivot(
+        con,
+        x_field,
+        y_field,
+        filters,
+        top_n_x=top_n_x,
+        top_n_y=top_n_y,
+        x_roll_up_depth=x_roll_up_depth,
+        y_roll_up_depth=y_roll_up_depth,
+    )
+    if df.empty:
+        return df
+    return df.loc[df["sample_count"] > 0].reset_index(drop=True)
+
+
+# ---- Cohort C4 (pinned-vs-current cohort comparison) ----
+
+
+def cohort_overlap_summary(
+    accessions_a: list[str], accessions_b: list[str]
+) -> dict[str, int]:
+    """Three-way set arithmetic for the pinned-vs-current Venn metrics.
+
+    Pure Python set math — no DuckDB dependency. The two inputs are usually
+    pre-materialized accession lists (``cohort_samples`` output's
+    ``accession`` column), so doing the comparison in-process avoids round-
+    tripping the lists through DuckDB twice.
+    """
+    set_a = set(accessions_a)
+    set_b = set(accessions_b)
+    return {
+        "only_a": len(set_a - set_b),
+        "both": len(set_a & set_b),
+        "only_b": len(set_b - set_a),
+    }
+
+
+def cohort_term_overlap(
+    con: duckdb.DuckDBPyConnection,
+    accessions_a: list[str],
+    accessions_b: list[str],
+    fields: list[str] | None = None,
+) -> pd.DataFrame:
+    """Per-field Jaccard overlap of term sets between two cohorts.
+
+    For each field, computes the distinct ``term_id`` set within each
+    cohort's accession list and reports cardinalities + Jaccard
+    (``|A∩B| / |A∪B|``). Used by Cohort C4 to surface "where does the
+    composition differ?" (low Jaccard) vs "same shape, different size"
+    (high Jaccard).
+    """
+    target_fields = list(fields) if fields else list(VALID_FIELDS)
+    for f in target_fields:
+        _validate_field(f)
+    out_cols = ["field", "n_pinned", "n_current", "n_both", "jaccard"]
+    if not accessions_a and not accessions_b:
+        return pd.DataFrame(columns=out_cols)
+
+    acc_a = sorted(set(accessions_a))
+    acc_b = sorted(set(accessions_b))
+
+    def _terms_for(field_name: str, accs: list[str]) -> set[str]:
+        if not accs:
+            return set()
+        rows = con.execute(
+            "SELECT DISTINCT term_id FROM facts "
+            "WHERE field = ? AND term_id IS NOT NULL "
+            "  AND accession IN (SELECT UNNEST(?::VARCHAR[]))",
+            [field_name, accs],
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    rows_out: list[dict[str, object]] = []
+    for fld in target_fields:
+        terms_a = _terms_for(fld, acc_a)
+        terms_b = _terms_for(fld, acc_b)
+        union = terms_a | terms_b
+        intersect = terms_a & terms_b
+        jaccard = (len(intersect) / len(union)) if union else 0.0
+        rows_out.append(
+            {
+                "field": fld,
+                "n_pinned": len(terms_a),
+                "n_current": len(terms_b),
+                "n_both": len(intersect),
+                "jaccard": float(jaccard),
+            }
+        )
+    return pd.DataFrame(rows_out, columns=out_cols)

@@ -84,10 +84,10 @@ CLI entrypoint: `src/bsllmner_viewer/etl/cli.py`。`uv run python -m bsllmner_vi
 | subcommand | 出力 | 内容 |
 |---|---|---|
 | `build-runs` | `runs.parquet` | 全 select_*.json の run_metadata を集約 |
-| `build-samples` | `samples.parquet` | input JSONL + select_*.json の accession 集合を join。in_chip_atlas / chip_atlas_genome は系統定義から導出 |
+| `build-samples` | `samples.parquet` | input JSONL + select_*.json の accession 集合を join。in_chip_atlas / chip_atlas_genome は系統定義から導出。SRX 列 (`srx_first` / `srx_count` / `srx_records`) は空に初期化し、`build-srx-links` 側で in-place 上書き |
 | `build-facts` | `facts.parquet` | select_*.json の entries を long format 展開 (extract_status 含む) |
 | `build-ontology` | `ontology.parquet` | subset OWL から term_id + label、フル OWL から subClassOf を `lxml.iterparse` で streaming 抽出 → subset 内に restrict → transitive closure |
-| `build-srx-links` | `srx_links.parquet` | `SRA_Accessions.tab` を streaming 読みし `Type == "EXPERIMENT"` かつ `BioSample` が samples.parquet の accession 集合に含まれる行を採用 |
+| `build-srx-links` | `srx_links.parquet` + samples.parquet 上書き | `SRA_Accessions.tab` を streaming 読みし `Type == "EXPERIMENT"` かつ `BioSample` が samples.parquet の accession 集合に含まれる行を採用。**完了後 samples.parquet を読み返し、accession 単位で aggregate して `srx_first` / `srx_count` / `srx_records` を inline で焼き込む** (tmp parquet → `os.replace` で atomic swap)。UI 側の Per-SRX deep links 描画はこの inline 列だけで完結する |
 | `build-all` | 全 parquet | 上記を依存順 (runs → samples → facts → ontology → srx-links) で実行 |
 
 各 subcommand は `--source-system` で系統を絞れる (省略時は全系統)。`--out-dir` で出力先を override 可能 (default `${BSLLMNER_VIEWER_DATA_DIR}/parquet`)。
