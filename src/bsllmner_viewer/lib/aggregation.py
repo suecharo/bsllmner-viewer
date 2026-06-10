@@ -1229,7 +1229,7 @@ def mixed_bs_srx_composition(
         "         COUNT(*) AS n "
         "  FROM srx_links sl "
         "  WHERE sl.accession IN (SELECT accession FROM bs) "
-        "  GROUP BY sl.accession, COALESCE(sl.sequence_type, ?)"
+        "  GROUP BY sl.accession, seq"
         "), "
         "per_acc AS ("
         "  SELECT accession, "
@@ -1248,7 +1248,7 @@ def mixed_bs_srx_composition(
         "LIMIT ?"
     )
     df = con.execute(
-        sql, [*where_params, UNKNOWN, UNKNOWN, top_n]
+        sql, [*where_params, UNKNOWN, top_n]
     ).fetchdf()
     cols = ["pattern", "pattern_label", "n_bs", "n_srx"]
     if df.empty:
