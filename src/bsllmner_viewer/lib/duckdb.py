@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -39,9 +40,48 @@ def default_parquet_dir() -> Path:
     return Path(os.environ.get("BSLLMNER_VIEWER_DATA_DIR", "/app/data")) / "parquet"
 
 
+def parquet_path(name: str, parquet_dir: Path | None = None) -> Path:
+    """Return the absolute path to ``<name>.parquet`` under the data dir.
+
+    Used by callers that read parquet metadata directly (e.g.
+    ``summary_counts_fast`` reads ``num_rows`` instead of issuing a full
+    ``COUNT(*)`` scan).
+    """
+    pdir = parquet_dir if parquet_dir is not None else default_parquet_dir()
+    return pdir / f"{name}.parquet"
+
+
+def _apply_pragmas(con: duckdb.DuckDBPyConnection) -> None:
+    """Tune the in-process DuckDB connection for the UI's cold-start workload.
+
+    ``preserve_insertion_order=false`` lets DuckDB hash-merge wide aggregations
+    without an ORDER preservation barrier — measurable on 13.3M facts scans.
+    ``enable_object_cache`` keeps parquet metadata + row group footers cached
+    across queries (every subsequent query against the same parquet skips
+    re-parsing). ``threads``, ``memory_limit``, ``temp_directory`` are taken
+    from env so deploy-time tuning never requires a code change.
+    """
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA enable_object_cache=true")
+    threads = os.environ.get("BSLLMNER_VIEWER_DUCKDB_THREADS")
+    if threads:
+        with contextlib.suppress(duckdb.Error, ValueError):
+            con.execute(f"PRAGMA threads={int(threads)}")
+    memory_limit = os.environ.get("BSLLMNER_VIEWER_DUCKDB_MEMORY_LIMIT")
+    if memory_limit:
+        # PRAGMA memory_limit accepts e.g. "4GB" / "512MB" verbatim.
+        with contextlib.suppress(duckdb.Error):
+            con.execute(f"PRAGMA memory_limit='{memory_limit}'")
+    temp_dir = os.environ.get("BSLLMNER_VIEWER_DUCKDB_TEMP_DIR")
+    if temp_dir:
+        with contextlib.suppress(duckdb.Error):
+            con.execute(f"PRAGMA temp_directory='{temp_dir}'")
+
+
 def get_conn(parquet_dir: Path | None = None) -> duckdb.DuckDBPyConnection:
     pdir = parquet_dir if parquet_dir is not None else default_parquet_dir()
     con = duckdb.connect(database=":memory:")
+    _apply_pragmas(con)
     for name in _PARQUET_NAMES:
         path = pdir / f"{name}.parquet"
         if path.exists():

@@ -11,6 +11,7 @@ from bsllmner_viewer.lib.aggregation import (
     has_dashboard_aggregates,
     samples_by_organism,
     samples_by_organism_fast,
+    samples_by_sequence_type,
     samples_by_sequence_type_fast,
     samples_by_source,
     samples_by_source_fast,
@@ -21,6 +22,24 @@ from bsllmner_viewer.lib.aggregation import (
     top_terms_overall_fast,
 )
 from bsllmner_viewer.ui._conn import conn
+
+# Donut color / order convention shared across F2 sequence_type chart.
+# 'mixed' and '(unknown)' are de-emphasised by grey fill + tail position so
+# they do not dilute the dominant assay signal (docs/ui.md §F2).
+_SEQ_TYPE_ORDER_HEAD: tuple[str, ...] = (
+    "ChIP-Seq",
+    "ChIP-Seq (input)",
+    "ATAC-Seq",
+    "DNase-Seq",
+    "Bisulfite-Seq",
+    "RNA-Seq",
+    "Annotation track",
+)
+_SEQ_TYPE_TAIL: tuple[str, ...] = ("mixed", "(unknown)")
+_SEQ_TYPE_COLOR_MAP: dict[str, str] = {
+    "mixed": "#bbbbbb",
+    "(unknown)": "#dddddd",
+}
 
 st.set_page_config(page_title="bsllmner-viewer", layout="wide")
 
@@ -41,7 +60,7 @@ def _summary() -> dict[str, int]:
     n_runs = c.execute("SELECT COUNT(*) FROM runs").fetchone()
     n_facts = c.execute("SELECT COUNT(*) FROM facts").fetchone()
     n_chip = c.execute(
-        "SELECT COUNT(*) FROM samples WHERE in_chip_atlas"
+        "SELECT COUNT(*) FROM samples WHERE source_system LIKE 'chip-atlas-%'"
     ).fetchone()
     n_terms = c.execute(
         "SELECT COUNT(DISTINCT term_id) FROM ontology"
@@ -93,12 +112,12 @@ def _sources() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def _seq_types() -> pd.DataFrame | None:
-    """sequence_type 別 sample 数 donut の data。agg 不在時は None。"""
+def _seq_types() -> pd.DataFrame:
+    """sequence_type 別 sample 数 donut の data。"""
     c = conn()
-    if not has_dashboard_aggregates(c):
-        return None
-    return samples_by_sequence_type_fast(c)
+    if has_dashboard_aggregates(c):
+        return samples_by_sequence_type_fast(c)
+    return samples_by_sequence_type(c)
 
 
 @st.cache_data(show_spinner=False)
@@ -142,9 +161,7 @@ else:
 
 # F2: Organism + Source + Sequence type donuts
 st.subheader("Organism / source / sequence type split")
-seq_df = _seq_types()
-n_cols = 3 if seq_df is not None and not seq_df.empty else 2
-cols = st.columns(n_cols)
+cols = st.columns(3)
 with cols[0]:
     org_df = _organisms()
     if org_df.empty:
@@ -179,14 +196,26 @@ with cols[1]:
             modebar={"remove": ["fullscreen", "togglefullscreen"]},
         )
         st.plotly_chart(fig_src, width="stretch", key="home_src_donut")
-if n_cols == 3 and seq_df is not None and not seq_df.empty:
-    with cols[2]:
+with cols[2]:
+    seq_df = _seq_types()
+    if seq_df.empty:
+        st.caption("No sequence_type data.")
+    else:
+        present = set(seq_df["sequence_type"].astype(str))
+        ordered = [s for s in _SEQ_TYPE_ORDER_HEAD if s in present]
+        extras = sorted(
+            present - set(_SEQ_TYPE_ORDER_HEAD) - set(_SEQ_TYPE_TAIL)
+        )
+        tail = [s for s in _SEQ_TYPE_TAIL if s in present]
         fig_seq = px.pie(
             seq_df,
             names="sequence_type",
             values="sample_count",
             hole=0.5,
             title="Sequence type",
+            category_orders={"sequence_type": [*ordered, *extras, *tail]},
+            color="sequence_type",
+            color_discrete_map=_SEQ_TYPE_COLOR_MAP,
         )
         fig_seq.update_layout(
             height=320,

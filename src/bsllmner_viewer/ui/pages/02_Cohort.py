@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import duckdb
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,14 +19,104 @@ from bsllmner_viewer.lib.aggregation import (
     cohort_srx_links,
     cohort_term_overlap,
 )
+from bsllmner_viewer.lib.chip_atlas import bigwig_url, peak_bed_url
 from bsllmner_viewer.lib.ontology import term_summaries
 from bsllmner_viewer.ui._conn import conn
-from bsllmner_viewer.ui._filters import sidebar_filters
+from bsllmner_viewer.ui._filters import _year_bounds, sidebar_filters
 from bsllmner_viewer.ui._term_popover import render_term_popover
 
 st.set_page_config(page_title="Cohort — bsllmner-viewer", layout="wide")
 
 st.title("Cohort drill-down")
+
+
+# --- SPD-1: cached cohort query wrappers ---
+# Cohort renders 6 derived views off the same (filters, facts_terms, facts_cells)
+# selection on every sidebar nudge. Wrapping each call in `@st.cache_data` keys
+# off the frozen `SampleFilters` plus the tuple-of-tuple facts selection so a
+# repeat render with identical inputs hits the cache instead of re-querying
+# DuckDB. `_con` is underscore-prefixed so Streamlit skips it in the cache key.
+
+
+@st.cache_data(show_spinner=False)
+def _cohort_count_cached(
+    _con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+    facts_terms: tuple[tuple[str, str], ...] | None,
+    facts_cells: tuple[tuple[tuple[str, str], ...], ...] | None,
+) -> int:
+    return cohort_count(
+        _con,
+        filters,
+        facts_terms=list(facts_terms) if facts_terms else None,
+        facts_cells=(
+            [list(cell) for cell in facts_cells] if facts_cells else None
+        ),
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cohort_breakdown_cached(
+    _con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+    facts_terms: tuple[tuple[str, str], ...] | None,
+    facts_cells: tuple[tuple[tuple[str, str], ...], ...] | None,
+) -> pd.DataFrame:
+    return cohort_breakdown(
+        _con,
+        filters,
+        facts_terms=list(facts_terms) if facts_terms else None,
+        facts_cells=(
+            [list(cell) for cell in facts_cells] if facts_cells else None
+        ),
+    )
+
+
+@st.cache_data(show_spinner="Loading cohort samples…")
+def _cohort_samples_cached(
+    _con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+    facts_terms: tuple[tuple[str, str], ...] | None,
+    facts_cells: tuple[tuple[tuple[str, str], ...], ...] | None,
+    limit: int,
+) -> pd.DataFrame:
+    return cohort_samples(
+        _con,
+        filters,
+        facts_terms=list(facts_terms) if facts_terms else None,
+        facts_cells=(
+            [list(cell) for cell in facts_cells] if facts_cells else None
+        ),
+        limit=limit,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cohort_facts_columns_cached(
+    _con: duckdb.DuckDBPyConnection,
+    accessions: tuple[str, ...],
+    fields: tuple[str, ...],
+) -> pd.DataFrame:
+    return cohort_facts_columns(_con, list(accessions), list(fields))
+
+
+@st.cache_data(show_spinner=False)
+def _cohort_srx_links_cached(
+    _con: duckdb.DuckDBPyConnection,
+    accessions: tuple[str, ...],
+    limit: int,
+) -> pd.DataFrame:
+    return cohort_srx_links(_con, list(accessions), limit=limit)
+
+
+@st.cache_data(show_spinner=False)
+def _cohort_term_overlap_cached(
+    _con: duckdb.DuckDBPyConnection,
+    accessions_a: tuple[str, ...],
+    accessions_b: tuple[str, ...],
+) -> pd.DataFrame:
+    return cohort_term_overlap(_con, list(accessions_a), list(accessions_b))
+
 
 con = conn()
 
@@ -77,10 +169,15 @@ if filters_default is not None and "cohort_seeded" not in st.session_state:
     st.session_state["filter_sequence_type"] = (
         filters_default.sequence_type
     )
-    if filters_default.in_chip_atlas is True:
-        st.session_state["filter_chip_atlas"] = "Only ChIP-Atlas"
-    elif filters_default.in_chip_atlas is False:
-        st.session_state["filter_chip_atlas"] = "Exclude ChIP-Atlas"
+    if (
+        filters_default.submission_year_min is not None
+        or filters_default.submission_year_max is not None
+    ):
+        year_lo, year_hi = _year_bounds(con)
+        st.session_state["filter_year"] = (
+            filters_default.submission_year_min or year_lo,
+            filters_default.submission_year_max or year_hi,
+        )
     st.session_state["cohort_seeded"] = True
 
 filters = sidebar_filters(con)
@@ -98,9 +195,19 @@ if _cohort_terms:
             summary=cohort_term_summaries.get(term_id),
         )
 
-total = cohort_count(
-    con, filters, facts_terms=facts_terms, facts_cells=facts_cells
+# Hashable variants of the cohort selection for `@st.cache_data` keys. We
+# convert the session-state lists into tuples-of-tuples once, then reuse the
+# same key shape across every cached helper.
+facts_terms_key: tuple[tuple[str, str], ...] | None = (
+    tuple((f, t) for f, t in facts_terms) if facts_terms else None
 )
+facts_cells_key: tuple[tuple[tuple[str, str], ...], ...] | None = (
+    tuple(tuple((f, t) for f, t in cell) for cell in facts_cells)
+    if facts_cells
+    else None
+)
+
+total = _cohort_count_cached(con, filters, facts_terms_key, facts_cells_key)
 st.metric("Total BioSamples", f"{total:,}")
 
 if total == 0:
@@ -110,8 +217,8 @@ if total == 0:
 # 3-up mini histograms: cohort outline (year / organism / source). Aggregates
 # the whole cohort in SQL via cohort_breakdown so the 10K table cap below
 # doesn't truncate the histograms — they always reflect the full `total`.
-breakdown = cohort_breakdown(
-    con, filters, facts_terms=facts_terms, facts_cells=facts_cells
+breakdown = _cohort_breakdown_cached(
+    con, filters, facts_terms_key, facts_cells_key
 )
 if not breakdown.empty:
     year_df = (
@@ -183,12 +290,8 @@ if not breakdown.empty:
         st.plotly_chart(fig_src, width="stretch", key="cohort_mini_src")
 
 LIMIT = 10000
-df = cohort_samples(
-    con,
-    filters,
-    facts_terms=facts_terms,
-    facts_cells=facts_cells,
-    limit=LIMIT,
+df = _cohort_samples_cached(
+    con, filters, facts_terms_key, facts_cells_key, LIMIT
 )
 if total > LIMIT:
     st.warning(
@@ -289,8 +392,8 @@ with st.expander("🔖 Pinned cohort", expanded=False):
             # Per-field Jaccard overlap. Compares the *term sets* derived
             # from each cohort's facts so the user sees not just sample
             # overlap but compositional similarity per ontology field.
-            overlap_df = cohort_term_overlap(
-                con, pinned_accs, current_accessions
+            overlap_df = _cohort_term_overlap_cached(
+                con, tuple(pinned_accs), tuple(current_accessions)
             )
             overlap_df = overlap_df[
                 (overlap_df["n_pinned"] > 0) | (overlap_df["n_current"] > 0)
@@ -392,8 +495,10 @@ with st.expander(
     )
 
 if selected_fields:
-    facts_cols_df = cohort_facts_columns(
-        con, df["accession"].tolist(), selected_fields
+    facts_cols_df = _cohort_facts_columns_cached(
+        con,
+        tuple(str(a) for a in df["accession"].tolist()),
+        tuple(selected_fields),
     )
     if not facts_cols_df.empty:
         pivot = facts_cols_df.pivot(
@@ -411,7 +516,7 @@ display_cols = [
     "submission_year",
     "title",
     "source_system",
-    "in_chip_atlas",
+    "sequence_type",
     "srx",
     "srx_display",
     *selected_fields,
@@ -423,7 +528,9 @@ st.dataframe(
     hide_index=True,
     column_config={
         "accession": st.column_config.TextColumn(width="small"),
-        "in_chip_atlas": st.column_config.CheckboxColumn(),
+        "sequence_type": st.column_config.TextColumn(
+            "sequence_type", width="small",
+        ),
         "title": st.column_config.TextColumn(width="large"),
         "srx": st.column_config.TextColumn("srx (first)", width="small"),
         "srx_display": st.column_config.TextColumn(
@@ -469,14 +576,18 @@ def _ddbj_sra_url(srx: object) -> str:
     return f"https://ddbj-search.dbcls.jp/resource/sra-experiment/{srx}"
 
 
-def _chip_atlas_url(srx: object, genome: object, kind: str) -> str:
+def _bigwig_url(srx: object, source_system: object) -> str:
     if not isinstance(srx, str) or not srx:
         return ""
-    if not isinstance(genome, str) or not genome:
+    src = source_system if isinstance(source_system, str) else None
+    return bigwig_url(src, srx) or ""
+
+
+def _peak_bed_url(srx: object, source_system: object) -> str:
+    if not isinstance(srx, str) or not srx:
         return ""
-    if kind == "bw":
-        return f"https://chip-atlas.dbcls.jp/data/{genome}/eachData/bw/{srx}.bw"
-    return f"https://chip-atlas.dbcls.jp/data/{genome}/eachData/bed05/{srx}.05.bed"
+    src = source_system if isinstance(source_system, str) else None
+    return peak_bed_url(src, srx) or ""
 
 
 # --- Per-SRX deep links (expanded to 1 row per SRX, so +N more are reachable) ---
@@ -484,7 +595,9 @@ st.subheader("Per-SRX deep links")
 
 SRX_LIMIT = 500
 cohort_accessions = df["accession"].tolist()
-srx_df = cohort_srx_links(con, cohort_accessions, limit=SRX_LIMIT)
+srx_df = _cohort_srx_links_cached(
+    con, tuple(str(a) for a in cohort_accessions), SRX_LIMIT
+)
 
 if srx_df.empty:
     st.caption(
@@ -512,15 +625,15 @@ else:
             "SRX (NCBI)": srx_df["srx"].map(_ncbi_sra_url),
             "SRX (DDBJ)": srx_df["srx"].map(_ddbj_sra_url),
             "ChIP-Atlas BigWig": [
-                _chip_atlas_url(s, g, "bw")
-                for s, g in zip(
-                    srx_df["srx"], srx_df["chip_atlas_genome"], strict=True
+                _bigwig_url(s, ss)
+                for s, ss in zip(
+                    srx_df["srx"], srx_df["source_system"], strict=True
                 )
             ],
             "ChIP-Atlas Peak BED": [
-                _chip_atlas_url(s, g, "bed")
-                for s, g in zip(
-                    srx_df["srx"], srx_df["chip_atlas_genome"], strict=True
+                _peak_bed_url(s, ss)
+                for s, ss in zip(
+                    srx_df["srx"], srx_df["source_system"], strict=True
                 )
             ],
         }
@@ -571,7 +684,8 @@ else:
 
 st.caption(
     "ChIP-Atlas BigWig / Peak BED are best-effort URLs built from `srx` + "
-    "`chip_atlas_genome` (samples 系統). The SRX may not actually exist in "
+    "`source_system` が ChIP-Atlas 系統のとき (chip-atlas-hg38 / "
+    "chip-atlas-mm10) のみ生成される。The SRX may not actually exist in "
     "ChIP-Atlas (HTTP 404 possible). BigWig / Peak BED columns are empty "
     "for samples whose 系統 is not chip-atlas."
 )

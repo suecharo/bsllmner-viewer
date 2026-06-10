@@ -160,6 +160,25 @@ def build_facts(
                 )
 
     table = pa.Table.from_pylist(rows, schema=_SCHEMA)
+    # UI hot paths almost always filter on ``field`` first
+    # (top_unmapped_values / raw_value_term_flow / cohort_facts_columns) and
+    # then on ``term_id`` or ``accession``. Sort the table on that key order
+    # so the parquet row groups are clustered by ``field``; combined with
+    # column statistics this lets DuckDB skip whole row groups when the
+    # predicate doesn't match.
+    table = table.sort_by(
+        [
+            ("field", "ascending"),
+            ("accession", "ascending"),
+            ("term_id", "ascending"),
+        ]
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, out_path)
+    pq.write_table(
+        table,
+        out_path,
+        row_group_size=131_072,
+        compression="zstd",
+        write_statistics=True,
+    )
     logger.info("wrote %d fact rows to %s", len(rows), out_path)

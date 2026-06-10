@@ -133,17 +133,15 @@ def _load(
     source: tuple[str, ...],
     year_min: int | None,
     year_max: int | None,
-    in_chip_atlas: bool | None,
     sequence_type: tuple[str, ...],
     roll_up_depth: int | None,
 ) -> pd.DataFrame:
     f = SampleFilters(
-        organism_normalized=list(organism),
-        source_system=list(source),
+        organism_normalized=organism,
+        source_system=source,
         submission_year_min=year_min,
         submission_year_max=year_max,
-        in_chip_atlas=in_chip_atlas,
-        sequence_type=list(sequence_type),
+        sequence_type=sequence_type,
     )
     c = conn()
     # fast path: agg_field_term_dims (small parquet) を読む。roll_up_depth が
@@ -158,7 +156,7 @@ def _load(
                 c, field_name, f, top_n, roll_up_depth=roll_up_depth
             )
         df["count"] = df["sample_count_cum"]
-        df["chip_count"] = df["chip_atlas_count_cum"]
+        df["secondary"] = df["secondary_count_cum"]
     else:
         if use_fast:
             df = bubble_dataset_fast(c, field_name, f, top_n)
@@ -167,7 +165,7 @@ def _load(
                 c, field_name, f, top_n, roll_up_depth=roll_up_depth
             )
         df["count"] = df["sample_count"]
-        df["chip_count"] = df["chip_atlas_count"]
+        df["secondary"] = df["secondary_count"]
     return df
 
 
@@ -175,7 +173,7 @@ def _cumulate(df: pd.DataFrame) -> pd.DataFrame:
     """``bubble_dataset_fast`` の戻り (年毎) を ``cumulative_bubble_dataset`` 形式
     (累積) に変換する純関数。
     """
-    cum_cols = ["sample_count_cum", "chip_atlas_count_cum"]
+    cum_cols = ["sample_count_cum", "secondary_count_cum"]
     if df.empty:
         for col in cum_cols:
             df[col] = pd.Series(dtype="int64")
@@ -192,7 +190,7 @@ def _cumulate(df: pd.DataFrame) -> pd.DataFrame:
         ["term_id", "organism_normalized"], sort=False
     ):
         sub = (
-            g[["submission_year", "sample_count", "chip_atlas_count"]]
+            g[["submission_year", "sample_count", "secondary_count"]]
             .set_index("submission_year")
             .reindex(full_years, fill_value=0)
         )
@@ -200,7 +198,7 @@ def _cumulate(df: pd.DataFrame) -> pd.DataFrame:
         sub["organism_normalized"] = org
         sub["label"] = term_labels.get(term_id, term_id)
         sub["sample_count_cum"] = sub["sample_count"].cumsum()
-        sub["chip_atlas_count_cum"] = sub["chip_atlas_count"].cumsum()
+        sub["secondary_count_cum"] = sub["secondary_count"].cumsum()
         parts.append(sub.reset_index())
     return pd.concat(parts, ignore_index=True)
 
@@ -213,7 +211,6 @@ df = _load(
     tuple(filters.source_system),
     filters.submission_year_min,
     filters.submission_year_max,
-    filters.in_chip_atlas,
     tuple(filters.sequence_type),
     roll_up_depth,
 )
@@ -250,17 +247,17 @@ df["x_pos"] = df["label"].map(label_to_x)
 chart_state_key = (
     f"{mode}|{field_name}|{top_n}|{roll_up_depth}|{y_log}|{size_log}|"
     f"{tuple(filters.organism_normalized)}|{tuple(filters.source_system)}|"
-    f"{filters.submission_year_min}|{filters.submission_year_max}|"
-    f"{filters.in_chip_atlas}"
+    f"{tuple(filters.sequence_type)}|"
+    f"{filters.submission_year_min}|{filters.submission_year_max}"
 )
 
 count_axis_title = (
     "BioSample count (cumulative)" if mode == "Cumulative"
     else "BioSample count (per-year)"
 )
-chip_axis_title = (
-    "ChIP-Atlas (cumulative)" if mode == "Cumulative"
-    else "ChIP-Atlas (per-year)"
+secondary_axis_title = (
+    "Overlay count (cumulative)" if mode == "Cumulative"
+    else "Overlay count (per-year)"
 )
 
 (
@@ -317,7 +314,7 @@ with tab_bubble:
             hover_data={
                 "term_id": True,
                 "count": True,
-                "chip_count": True,
+                "secondary": True,
                 "bubble_size": False,
                 "trace_key": False,
                 "submission_year": False,
@@ -328,7 +325,7 @@ with tab_bubble:
             range_x=[-0.5, len(category_order) - 0.5],
             labels={
                 "count": count_axis_title,
-                "chip_count": chip_axis_title,
+                "secondary": secondary_axis_title,
                 "organism_normalized": "Organism",
             },
         )
@@ -373,7 +370,7 @@ with tab_line:
         line_dash="organism_normalized",
         hover_data={
             "term_id": True,
-            "chip_count": True,
+            "secondary": True,
             "organism_normalized": True,
         },
         markers=True,
@@ -381,7 +378,7 @@ with tab_line:
         labels={
             "submission_year": "Submission year",
             "count": count_axis_title,
-            "chip_count": chip_axis_title,
+            "secondary": secondary_axis_title,
             "label": field_name,
             "organism_normalized": "Organism",
         },
@@ -404,7 +401,7 @@ with tab_line:
 # every toggle (mode / log) still triggers a fresh render.
 agg_df = (
     df.groupby(["submission_year", "term_id", "label"], as_index=False)
-    .agg(count=("count", "sum"), chip_count=("chip_count", "sum"))
+    .agg(count=("count", "sum"), secondary=("secondary", "sum"))
 )
 agg_df["submission_year"] = agg_df["submission_year"].astype(int)
 # Order terms by their overall maximum count across the timeline — used as a
@@ -439,7 +436,7 @@ with tab_race:
             hover_data={
                 "term_id": True,
                 "rank": True,
-                "chip_count": True,
+                "secondary": True,
                 "label": False,
                 "submission_year": False,
             },
@@ -450,7 +447,7 @@ with tab_race:
             labels={
                 "count": count_axis_title,
                 "label": field_name,
-                "chip_count": chip_axis_title,
+                "secondary": secondary_axis_title,
             },
         )
         # Pin category order by overall importance so bars don't fully
@@ -548,14 +545,14 @@ with tab_comp:
             color="label",
             groupnorm="percent" if normalize else None,
             category_orders={"label": overall_order},
-            hover_data={"term_id": True, "chip_count": True},
+            hover_data={"term_id": True, "secondary": True},
             labels={
                 "submission_year": "Submission year",
                 "count": (
                     "Share (%)" if normalize else count_axis_title
                 ),
                 "label": field_name,
-                "chip_count": chip_axis_title,
+                "secondary": secondary_axis_title,
             },
         )
         if normalize:
@@ -689,15 +686,15 @@ with tab_momentum:
         source: tuple[str, ...],
         year_min: int | None,
         year_max: int | None,
-        in_chip_atlas: bool | None,
+        sequence_type: tuple[str, ...],
         roll_up_depth: int | None,
     ) -> pd.DataFrame:
         f = SampleFilters(
-            organism_normalized=list(organism),
-            source_system=list(source),
+            organism_normalized=organism,
+            source_system=source,
             submission_year_min=year_min,
             submission_year_max=year_max,
-            in_chip_atlas=in_chip_atlas,
+            sequence_type=sequence_type,
         )
         return momentum_dataset(
             conn(), field_name, f, top_n=top_n, roll_up_depth=roll_up_depth
@@ -710,7 +707,7 @@ with tab_momentum:
         tuple(filters.source_system),
         filters.submission_year_min,
         filters.submission_year_max,
-        filters.in_chip_atlas,
+        tuple(filters.sequence_type),
         roll_up_depth,
     )
     if mom_df.empty:
@@ -814,15 +811,15 @@ with tab_diversity:
         source: tuple[str, ...],
         year_min: int | None,
         year_max: int | None,
-        in_chip_atlas: bool | None,
+        sequence_type: tuple[str, ...],
         roll_up_depth: int | None,
     ) -> pd.DataFrame:
         f = SampleFilters(
-            organism_normalized=list(organism),
-            source_system=list(source),
+            organism_normalized=organism,
+            source_system=source,
             submission_year_min=year_min,
             submission_year_max=year_max,
-            in_chip_atlas=in_chip_atlas,
+            sequence_type=sequence_type,
         )
         return cumulative_diversity(
             conn(), field_name, f, group_by=group_by, roll_up_depth=roll_up_depth
@@ -835,7 +832,7 @@ with tab_diversity:
         tuple(filters.source_system),
         filters.submission_year_min,
         filters.submission_year_max,
-        filters.in_chip_atlas,
+        tuple(filters.sequence_type),
         roll_up_depth,
     )
     if div_df.empty:
@@ -882,15 +879,15 @@ with tab_concentration:
         source: tuple[str, ...],
         year_min: int | None,
         year_max: int | None,
-        in_chip_atlas: bool | None,
+        sequence_type: tuple[str, ...],
         roll_up_depth: int | None,
     ) -> pd.DataFrame:
         f = SampleFilters(
-            organism_normalized=list(organism),
-            source_system=list(source),
+            organism_normalized=organism,
+            source_system=source,
             submission_year_min=year_min,
             submission_year_max=year_max,
-            in_chip_atlas=in_chip_atlas,
+            sequence_type=sequence_type,
         )
         return concentration_over_time(
             conn(), field_name, f, roll_up_depth=roll_up_depth
@@ -902,7 +899,7 @@ with tab_concentration:
         tuple(filters.source_system),
         filters.submission_year_min,
         filters.submission_year_max,
-        filters.in_chip_atlas,
+        tuple(filters.sequence_type),
         roll_up_depth,
     )
     if conc_df.empty:
@@ -975,14 +972,14 @@ with tab_treemap:
             source: tuple[str, ...],
             year_min: int | None,
             year_max: int | None,
-            in_chip_atlas: bool | None,
+            sequence_type: tuple[str, ...],
         ) -> pd.DataFrame:
             f = SampleFilters(
-                organism_normalized=list(organism),
-                source_system=list(source),
+                organism_normalized=organism,
+                source_system=source,
                 submission_year_min=year_min,
                 submission_year_max=year_max,
-                in_chip_atlas=in_chip_atlas,
+                sequence_type=sequence_type,
             )
             return term_hierarchy_breakdown(
                 conn(),
@@ -999,7 +996,7 @@ with tab_treemap:
             tuple(filters.source_system),
             filters.submission_year_min,
             filters.submission_year_max,
-            filters.in_chip_atlas,
+            tuple(filters.sequence_type),
         )
         if hier_df.empty:
             st.info(
@@ -1007,9 +1004,9 @@ with tab_treemap:
             )
         else:
             hier_df = hier_df.copy()
-            hier_df["chip_atlas_ratio"] = np.where(
+            hier_df["secondary_ratio"] = np.where(
                 hier_df["sample_count"] > 0,
-                hier_df["chip_atlas_count"] / hier_df["sample_count"],
+                hier_df["secondary_count"] / hier_df["sample_count"],
                 0.0,
             )
             # Plotly treemap needs every parent_term_id to appear as a
@@ -1027,8 +1024,8 @@ with tab_treemap:
                         "label": p,
                         "depth": 0,
                         "sample_count": 0,
-                        "chip_atlas_count": 0,
-                        "chip_atlas_ratio": 0.0,
+                        "secondary_count": 0,
+                        "secondary_ratio": 0.0,
                     }
                     for year in sorted(
                         hier_df["submission_year"].astype(int).unique()
@@ -1067,18 +1064,18 @@ with tab_treemap:
                     parents="parent_term_id",
                     names="label",
                     values="sample_count",
-                    color="chip_atlas_ratio",
+                    color="secondary_ratio",
                     color_continuous_scale="RdYlGn",
                     range_color=(0.0, 1.0),
                     hover_data={
                         "term_id": True,
                         "depth": True,
-                        "chip_atlas_count": True,
-                        "chip_atlas_ratio": ":.2f",
+                        "secondary_count": True,
+                        "secondary_ratio": ":.2f",
                     },
                     labels={
-                        "chip_atlas_ratio": "ChIP-Atlas %",
-                        "chip_atlas_count": "ChIP-Atlas samples",
+                        "secondary_ratio": "Overlay %",
+                        "secondary_count": "Overlay samples",
                     },
                 )
                 fig_tree.update_layout(
@@ -1092,7 +1089,7 @@ with tab_treemap:
                 )
                 st.caption(
                     f"Ontology subtree at {tree_year}. Size = BioSample "
-                    "count; color = ChIP-Atlas coverage ratio (red = "
+                    "count; color = overlay coverage ratio (red = "
                     "uncovered, green = covered)."
                 )
 

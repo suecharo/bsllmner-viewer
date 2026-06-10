@@ -8,6 +8,7 @@ import streamlit as st
 
 from bsllmner_viewer.lib.aggregation import (
     FIELD_TO_ONTOLOGY,
+    OVERLAY_AXES,
     VALID_FIELDS,
     SampleFilters,
     can_roll_up,
@@ -75,24 +76,59 @@ with col_yd:
 
 tab_heatmap, tab_sunburst, tab_sankey = st.tabs(["Heatmap", "Sunburst", "Sankey"])
 
+OVERLAY_SEQ_TYPES: tuple[str, ...] = (
+    "ChIP-Seq",
+    "ATAC-Seq",
+    "RNA-Seq",
+    "DNase-Seq",
+    "Bisulfite-Seq",
+)
+
+
+def _format_overlay_axis(axis_id: str) -> str:
+    if axis_id.startswith("seq:"):
+        return f"Sequence type = {axis_id[4:]}"
+    spec = OVERLAY_AXES.get(axis_id)
+    return spec[0] if spec else axis_id
+
+
 with tab_heatmap:
     DISPLAY_MODES = (
         "BioSample count",
-        "ChIP-Atlas count",
-        "ChIP-Atlas ratio",
-        "Gap only (sample > 0, ChIP-Atlas = 0)",
+        "Overlay count",
+        "Overlay ratio",
+        "Gap only",
     )
-    display_mode = st.radio(
-        "Color values",
-        options=DISPLAY_MODES,
-        index=0,
-        horizontal=True,
-        help=(
-            "Switch what the heatmap color represents. The underlying cohort is "
-            "unchanged — only the color value and scale are remapped."
-        ),
-        key="gap_display_mode",
+    overlay_axis_options: tuple[str, ...] = tuple(OVERLAY_AXES.keys()) + tuple(
+        f"seq:{s}" for s in OVERLAY_SEQ_TYPES
     )
+    col_overlay, col_mode = st.columns([1, 2])
+    with col_overlay:
+        overlay_axis = st.selectbox(
+            "Overlay axis",
+            options=overlay_axis_options,
+            index=0,
+            format_func=_format_overlay_axis,
+            help=(
+                "Defines what `secondary_count` counts in each cell: either a "
+                "source-system bucket (ChIP-Atlas) or a specific `sequence_type` "
+                "value. Drives the Overlay count / ratio / Gap-only colorings."
+            ),
+            key="gap_overlay_axis",
+        )
+    with col_mode:
+        display_mode = st.radio(
+            "Color values",
+            options=DISPLAY_MODES,
+            index=0,
+            horizontal=True,
+            help=(
+                "Switch what the heatmap color represents. The underlying cohort "
+                "is unchanged — only the color value and scale are remapped."
+            ),
+            key="gap_display_mode",
+        )
+    overlay_label = _format_overlay_axis(overlay_axis)
 
     @st.cache_data(show_spinner="aggregating…")
     def _pivot(
@@ -101,18 +137,19 @@ with tab_heatmap:
         top_n: int,
         organism: tuple[str, ...],
         source: tuple[str, ...],
+        sequence_type: tuple[str, ...],
         year_min: int | None,
         year_max: int | None,
-        in_chip_atlas: bool | None,
+        overlay_axis: str,
         x_roll_up_depth: int | None,
         y_roll_up_depth: int | None,
     ) -> pd.DataFrame:
         f = SampleFilters(
-            organism_normalized=list(organism),
-            source_system=list(source),
+            organism_normalized=tuple(organism),
+            source_system=tuple(source),
+            sequence_type=tuple(sequence_type),
             submission_year_min=year_min,
             submission_year_max=year_max,
-            in_chip_atlas=in_chip_atlas,
         )
         return gap_heatmap_pivot(
             conn(),
@@ -123,6 +160,7 @@ with tab_heatmap:
             top_n,
             x_roll_up_depth=x_roll_up_depth,
             y_roll_up_depth=y_roll_up_depth,
+            overlay_axis=overlay_axis,
         )
 
     df = _pivot(
@@ -131,9 +169,10 @@ with tab_heatmap:
         top_n,
         tuple(filters.organism_normalized),
         tuple(filters.source_system),
+        tuple(filters.sequence_type),
         filters.submission_year_min,
         filters.submission_year_max,
-        filters.in_chip_atlas,
+        overlay_axis,
         x_roll_up_depth,
         y_roll_up_depth,
     )
@@ -157,7 +196,7 @@ with tab_heatmap:
         df.pivot_table(
             index="y_label",
             columns="x_label",
-            values="chip_atlas_count",
+            values="secondary_count",
             aggfunc="sum",
             fill_value=0,
         )
@@ -170,17 +209,17 @@ with tab_heatmap:
         color_label = "BioSample count"
         zmin: float | None = 0.0
         zmax: float | None = None
-    elif display_mode == "ChIP-Atlas count":
+    elif display_mode == "Overlay count":
         z_matrix = overlay_counts.astype(float)
         color_scale = "Blues"
-        color_label = "ChIP-Atlas count"
+        color_label = f"{overlay_label} count"
         zmin = 0.0
         zmax = None
-    elif display_mode == "ChIP-Atlas ratio":
+    elif display_mode == "Overlay ratio":
         safe_sample = pivot_counts.astype(float).replace(0, np.nan)
         z_matrix = overlay_counts.astype(float) / safe_sample
         color_scale = "RdYlGn"
-        color_label = "ChIP-Atlas / BioSample"
+        color_label = f"{overlay_label} / BioSample"
         zmin = 0.0
         zmax = 1.0
     else:  # Gap only
@@ -232,7 +271,7 @@ with tab_heatmap:
             f"{x_field}: %{{x}}<br>"
             f"{y_field}: %{{y}}<br>"
             "BioSample: %{customdata[0]}<br>"
-            "of which ChIP-Atlas: %{customdata[1]}<extra></extra>"
+            f"of which {overlay_label}: %{{customdata[1]}}<extra></extra>"
         ),
         showlegend=False,
         name="cell-select",
@@ -247,7 +286,9 @@ with tab_heatmap:
 
     clear_nonce = st.session_state.get("gap_heatmap_clear_nonce", 0)
     chart_key = (
-        f"gap_heatmap__{x_field}__{y_field}__{display_mode}__{clear_nonce}"
+        f"gap_heatmap__{x_field}__{y_field}__{display_mode}__{overlay_axis}__"
+        f"{tuple(filters.source_system)}__{tuple(filters.sequence_type)}__"
+        f"{clear_nonce}"
     )
     chart_event: object = st.plotly_chart(
         fig,
@@ -371,6 +412,7 @@ with tab_heatmap:
 
     if cells:
         rows = []
+        overlay_col = f"of which {overlay_label}"
         for c in cells:
             sample_count = (
                 int(pivot_counts.loc[c["y_label"], c["x_label"]])
@@ -378,7 +420,7 @@ with tab_heatmap:
                 and c["x_label"] in pivot_counts.columns
                 else None
             )
-            chip_atlas_count = (
+            secondary_count = (
                 int(overlay_counts.loc[c["y_label"], c["x_label"]])
                 if c["y_label"] in overlay_counts.index
                 and c["x_label"] in overlay_counts.columns
@@ -391,7 +433,7 @@ with tab_heatmap:
                     y_field: c["y_label"],
                     f"{y_field} term_id": c["y_term_id"],
                     "BioSample": sample_count,
-                    "of which ChIP-Atlas": chip_atlas_count,
+                    overlay_col: secondary_count,
                 }
             )
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
@@ -482,16 +524,16 @@ with tab_sunburst:
             depth: int,
             organism: tuple[str, ...],
             source: tuple[str, ...],
+            sequence_type: tuple[str, ...],
             year_min: int | None,
             year_max: int | None,
-            in_chip_atlas: bool | None,
         ) -> pd.DataFrame:
             f = SampleFilters(
-                organism_normalized=list(organism),
-                source_system=list(source),
+                organism_normalized=tuple(organism),
+                source_system=tuple(source),
+                sequence_type=tuple(sequence_type),
                 submission_year_min=year_min,
                 submission_year_max=year_max,
-                in_chip_atlas=in_chip_atlas,
             )
             return term_hierarchy_breakdown(
                 conn(), field, f, max_depth=depth, by_year=False
@@ -502,9 +544,9 @@ with tab_sunburst:
             sb_depth,
             tuple(filters.organism_normalized),
             tuple(filters.source_system),
+            tuple(filters.sequence_type),
             filters.submission_year_min,
             filters.submission_year_max,
-            filters.in_chip_atlas,
         )
         if sb_df.empty:
             st.info(
@@ -512,9 +554,9 @@ with tab_sunburst:
             )
         else:
             sb_df = sb_df.copy()
-            sb_df["chip_atlas_ratio"] = np.where(
+            sb_df["secondary_ratio"] = np.where(
                 sb_df["sample_count"] > 0,
-                sb_df["chip_atlas_count"] / sb_df["sample_count"],
+                sb_df["secondary_count"] / sb_df["sample_count"],
                 0.0,
             )
             # Pad missing parents so Plotly can close the tree.
@@ -530,8 +572,8 @@ with tab_sunburst:
                             "label": p,
                             "depth": 0,
                             "sample_count": 0,
-                            "chip_atlas_count": 0,
-                            "chip_atlas_ratio": 0.0,
+                            "secondary_count": 0,
+                            "secondary_ratio": 0.0,
                         }
                         for p in missing
                     ]
@@ -543,18 +585,18 @@ with tab_sunburst:
                 parents="parent_term_id",
                 names="label",
                 values="sample_count",
-                color="chip_atlas_ratio",
+                color="secondary_ratio",
                 color_continuous_scale="RdYlGn",
                 range_color=(0.0, 1.0),
                 hover_data={
                     "term_id": True,
                     "depth": True,
-                    "chip_atlas_count": True,
-                    "chip_atlas_ratio": ":.2f",
+                    "secondary_count": True,
+                    "secondary_ratio": ":.2f",
                 },
                 labels={
-                    "chip_atlas_ratio": "ChIP-Atlas %",
-                    "chip_atlas_count": "ChIP-Atlas samples",
+                    "secondary_ratio": "ChIP-Atlas %",
+                    "secondary_count": "ChIP-Atlas samples",
                 },
             )
             fig_sb.update_layout(
@@ -586,18 +628,18 @@ with tab_sankey:
         top_n_y: int,
         organism: tuple[str, ...],
         source: tuple[str, ...],
+        sequence_type: tuple[str, ...],
         year_min: int | None,
         year_max: int | None,
-        in_chip_atlas: bool | None,
         x_depth: int | None,
         y_depth: int | None,
     ) -> pd.DataFrame:
         f = SampleFilters(
-            organism_normalized=list(organism),
-            source_system=list(source),
+            organism_normalized=tuple(organism),
+            source_system=tuple(source),
+            sequence_type=tuple(sequence_type),
             submission_year_min=year_min,
             submission_year_max=year_max,
-            in_chip_atlas=in_chip_atlas,
         )
         return field_to_field_flow(
             conn(),
@@ -629,9 +671,9 @@ with tab_sankey:
         sank_top,
         tuple(filters.organism_normalized),
         tuple(filters.source_system),
+        tuple(filters.sequence_type),
         filters.submission_year_min,
         filters.submission_year_max,
-        filters.in_chip_atlas,
         x_roll_up_depth,
         y_roll_up_depth,
     )
@@ -673,7 +715,7 @@ with tab_sankey:
                 f"{x_field}: {r['x_label']}<br>"
                 f"{y_field}: {r['y_label']}<br>"
                 f"BioSample: {int(r['sample_count'])}<br>"
-                f"of which ChIP-Atlas: {int(r['chip_atlas_count'])}"
+                f"of which ChIP-Atlas: {int(r['secondary_count'])}"
             )
             for _, r in flow_df.iterrows()
         ]

@@ -6,6 +6,7 @@ import duckdb
 import pytest
 
 from bsllmner_viewer.lib.aggregation import (
+    UNKNOWN,
     SampleFilters,
     bubble_dataset,
     can_roll_up,
@@ -52,18 +53,22 @@ def test_top_terms_respects_organism_filter(
     pairs = top_terms(
         con,
         "disease",
-        SampleFilters(organism_normalized=["Mus musculus"]),
+        SampleFilters(organism_normalized=("Mus musculus",)),
         top_n=10,
     )
     assert pairs == [("MONDO:2", "diabetes")]
 
 
-def test_top_terms_respects_in_chip_atlas_filter(
+def test_top_terms_respects_source_system_filter(
     aggregation_parquet_dir: Path,
 ) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # 「ChIP-Atlas 系統に該当しない BS」は source_system="rnaseq-human" のみ。
     pairs = top_terms(
-        con, "disease", SampleFilters(in_chip_atlas=False), top_n=10
+        con,
+        "disease",
+        SampleFilters(source_system=("rnaseq-human",)),
+        top_n=10,
     )
     assert pairs == [("MONDO:2", "diabetes")]
 
@@ -77,7 +82,7 @@ def test_gap_heatmap_pivot_disease_x_drug(
     cells = {
         (r["x_term_id"], r["y_term_id"]): (
             r["sample_count"],
-            r["chip_atlas_count"],
+            r["secondary_count"],
         )
         for _, r in df.iterrows()
     }
@@ -95,7 +100,7 @@ def test_gap_heatmap_pivot_returns_empty_when_no_terms(
         con,
         "disease",
         "drug",
-        SampleFilters(organism_normalized=["NonExistent"]),
+        SampleFilters(organism_normalized=("NonExistent",)),
     )
     assert df.empty
     assert list(df.columns) == [
@@ -104,7 +109,7 @@ def test_gap_heatmap_pivot_returns_empty_when_no_terms(
         "y_term_id",
         "y_label",
         "sample_count",
-        "chip_atlas_count",
+        "secondary_count",
     ]
 
 
@@ -239,7 +244,7 @@ def test_bubble_dataset_groups_by_year_term_organism(
     rows = {
         (int(r["submission_year"]), r["term_id"], r["organism_normalized"]): (
             int(r["sample_count"]),
-            int(r["chip_atlas_count"]),
+            int(r["secondary_count"]),
         )
         for _, r in df.iterrows()
     }
@@ -349,7 +354,7 @@ def test_cumulative_bubble_dataset_fills_year_gaps_and_cumsums(
             int(r["submission_year"]),
             r["term_id"],
             r["organism_normalized"],
-        ): (int(r["sample_count_cum"]), int(r["chip_atlas_count_cum"]))
+        ): (int(r["sample_count_cum"]), int(r["secondary_count_cum"]))
         for _, r in df.iterrows()
     }
     # MONDO:1 (Homo): A1+A2 in 2024 → carries to 2025
@@ -375,12 +380,12 @@ def test_cumulative_bubble_dataset_empty_when_no_data(
     df = cumulative_bubble_dataset(
         con,
         "disease",
-        SampleFilters(organism_normalized=["NonExistent"]),
+        SampleFilters(organism_normalized=("NonExistent",)),
         top_n=10,
     )
     assert df.empty
     assert "sample_count_cum" in df.columns
-    assert "chip_atlas_count_cum" in df.columns
+    assert "secondary_count_cum" in df.columns
 
 
 # ---- term_sample_count ----
@@ -390,11 +395,11 @@ def test_term_sample_count_counts_distinct_samples(
     aggregation_parquet_dir: Path,
 ) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
-    # MONDO:1 leaf has A1 + A2; both are in_chip_atlas.
+    # MONDO:1 leaf has A1 + A2; both sit in chip-atlas-hg38 → overlay = 2.
     assert term_sample_count(
         con, "disease", "MONDO:1", SampleFilters()
     ) == (2, 2)
-    # MONDO:2 has only A3 (Mus, not in chip-atlas).
+    # MONDO:2 has only A3 (rnaseq-human, not a ChIP-Atlas source).
     assert term_sample_count(
         con, "disease", "MONDO:2", SampleFilters()
     ) == (1, 0)
@@ -408,7 +413,7 @@ def test_term_sample_count_respects_filters(
         con,
         "disease",
         "MONDO:1",
-        SampleFilters(organism_normalized=["Mus musculus"]),
+        SampleFilters(organism_normalized=("Mus musculus",)),
     )
     # Mus musculus filter drops A1/A2 (Homo) → 0 hits for MONDO:1.
     assert (n_sample, n_chip) == (0, 0)
@@ -447,11 +452,11 @@ def test_cohort_breakdown_partitions_by_year_organism_source(
         ): int(r["sample_count"])
         for _, r in df.iterrows()
     }
-    # A1/A2/A4/A5 -> (2024, Homo, src1) = 4 samples
-    # A3 -> (2025, Mus, src2) = 1 sample
+    # A1/A2/A4/A5 -> (2024, Homo, chip-atlas-hg38) = 4 samples
+    # A3 -> (2025, Mus, rnaseq-human) = 1 sample
     assert rows == {
-        (2024, "Homo sapiens", "src1"): 4,
-        (2025, "Mus musculus", "src2"): 1,
+        (2024, "Homo sapiens", "chip-atlas-hg38"): 4,
+        (2025, "Mus musculus", "rnaseq-human"): 1,
     }
 
 
@@ -476,7 +481,7 @@ def test_samples_by_year_source(aggregation_parquet_dir: Path) -> None:
         (int(r["submission_year"]), r["source_system"]): int(r["sample_count"])
         for _, r in df.iterrows()
     }
-    assert rows == {(2024, "src1"): 4, (2025, "src2"): 1}
+    assert rows == {(2024, "chip-atlas-hg38"): 4, (2025, "rnaseq-human"): 1}
 
 
 def test_samples_by_organism(aggregation_parquet_dir: Path) -> None:
@@ -490,7 +495,7 @@ def test_samples_by_source(aggregation_parquet_dir: Path) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
     df = samples_by_source(con)
     rows = {r["source_system"]: int(r["sample_count"]) for _, r in df.iterrows()}
-    assert rows == {"src1": 4, "src2": 1}
+    assert rows == {"chip-atlas-hg38": 4, "rnaseq-human": 1}
 
 
 def test_field_facts_status(aggregation_parquet_dir: Path) -> None:
@@ -549,12 +554,12 @@ def test_mapping_status_matrix_groups_by_field_source_status(
         for _, r in df.iterrows()
     }
     assert rows == {
-        ("disease", "src1", "ok"): 4,
-        ("disease", "src2", "ok"): 1,
-        ("drug", "src1", "ok"): 2,
-        ("drug", "src2", "mapping_failed"): 1,
-        ("tissue", "src1", "extract_failed"): 1,
-        ("tissue", "src1", "mapping_failed"): 2,
+        ("disease", "chip-atlas-hg38", "ok"): 4,
+        ("disease", "rnaseq-human", "ok"): 1,
+        ("drug", "chip-atlas-hg38", "ok"): 2,
+        ("drug", "rnaseq-human", "mapping_failed"): 1,
+        ("tissue", "chip-atlas-hg38", "extract_failed"): 1,
+        ("tissue", "chip-atlas-hg38", "mapping_failed"): 2,
     }
 
 
@@ -563,15 +568,15 @@ def test_mapping_status_matrix_respects_filters(
 ) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
     df = mapping_status_matrix(
-        con, SampleFilters(source_system=["src2"])
+        con, SampleFilters(source_system=("rnaseq-human",))
     )
     rows = {
         (r["field"], r["source_system"], r["extract_status"]): int(r["n"])
         for _, r in df.iterrows()
     }
     assert rows == {
-        ("disease", "src2", "ok"): 1,
-        ("drug", "src2", "mapping_failed"): 1,
+        ("disease", "rnaseq-human", "ok"): 1,
+        ("drug", "rnaseq-human", "mapping_failed"): 1,
     }
 
 
@@ -621,13 +626,13 @@ def test_top_unmapped_values_respects_filters(
     aggregation_parquet_dir: Path,
 ) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
-    # in_chip_atlas=False drops A1/A4 (both Homo, chip=True), so tissue
-    # mapping_failed rows go to zero.
+    # rnaseq-human のみに絞ると A1/A4 (chip-atlas-hg38) は弾かれるので
+    # tissue mapping_failed は 0 件になる。
     df = top_unmapped_values(
         con,
         "tissue",
         top_n=10,
-        filters=SampleFilters(in_chip_atlas=False),
+        filters=SampleFilters(source_system=("rnaseq-human",)),
     )
     assert df.empty
 
@@ -912,7 +917,7 @@ def test_momentum_dataset_empty_when_no_data(
     df = momentum_dataset(
         con,
         "disease",
-        SampleFilters(organism_normalized=["NonExistent"]),
+        SampleFilters(organism_normalized=("NonExistent",)),
         top_n=10,
     )
     assert df.empty
@@ -1026,7 +1031,7 @@ def test_concentration_over_time_empty_when_filtered_out(
     df = concentration_over_time(
         con,
         "disease",
-        SampleFilters(organism_normalized=["NonExistent"]),
+        SampleFilters(organism_normalized=("NonExistent",)),
     )
     assert df.empty
     assert list(df.columns) == [
@@ -1137,7 +1142,7 @@ def test_field_to_field_flow_empty_when_filtered_out(
         con,
         "disease",
         "drug",
-        SampleFilters(organism_normalized=["NonExistent"]),
+        SampleFilters(organism_normalized=("NonExistent",)),
     )
     assert df.empty
 
@@ -1221,7 +1226,7 @@ def test_top_terms_respects_sequence_type_filter(
     pairs = top_terms(
         con,
         "disease",
-        SampleFilters(sequence_type=["ATAC-Seq"]),
+        SampleFilters(sequence_type=("ATAC-Seq",)),
         top_n=10,
     )
     assert sorted(t for t, _ in pairs) == ["MONDO:10", "MONDO:11"]
@@ -1231,7 +1236,7 @@ def test_cohort_count_with_sequence_type_filter(
     aggregation_parquet_dir: Path,
 ) -> None:
     con = get_conn(parquet_dir=aggregation_parquet_dir)
-    n = cohort_count(con, SampleFilters(sequence_type=["RNA-Seq"]))
+    n = cohort_count(con, SampleFilters(sequence_type=("RNA-Seq",)))
     # A3 のみ RNA-Seq
     assert n == 1
 
@@ -1240,7 +1245,7 @@ def test_filter_clauses_emits_sequence_type_in_list() -> None:
     from bsllmner_viewer.lib.aggregation import _filter_clauses
 
     clause, params = _filter_clauses(
-        SampleFilters(sequence_type=["ChIP-Seq", "ATAC-Seq"])
+        SampleFilters(sequence_type=("ChIP-Seq", "ATAC-Seq"))
     )
     assert "s.sequence_type IN (?,?)" in clause
     assert params == ["ChIP-Seq", "ATAC-Seq"]
@@ -1253,9 +1258,121 @@ def test_top_terms_combination_filter(aggregation_parquet_dir: Path) -> None:
         con,
         "disease",
         SampleFilters(
-            sequence_type=["ChIP-Seq"],
-            organism_normalized=["Homo sapiens"],
+            sequence_type=("ChIP-Seq",),
+            organism_normalized=("Homo sapiens",),
         ),
         top_n=10,
     )
     assert pairs == [("MONDO:1", "neoplasm")]
+
+
+# ---- (unknown) sentinel ----
+
+
+def _connect_with_null_samples() -> duckdb.DuckDBPyConnection:
+    """In-memory samples + facts with explicit NULL organism / sequence_type.
+
+    UNKNOWN を IN list に含めた filter で NULL 行も拾えるかを検証するため、
+    NULL を持つ最小の samples / facts を直接作る。aggregation_parquet_dir の
+    fixture には NULL 行が無い (build_samples の正規化により NULL が出ない
+    場合が殆ど) ため、UNKNOWN 経路だけは別 fixture を組む。
+    """
+    con = duckdb.connect(":memory:")
+    con.execute(
+        "CREATE TABLE samples ("
+        "  accession VARCHAR, organism_normalized VARCHAR, submission_year INT, "
+        "  title VARCHAR, source_system VARCHAR, run_name VARCHAR, "
+        "  sequence_type VARCHAR, srx_first VARCHAR, srx_count INT"
+        ")"
+    )
+    con.execute(
+        "INSERT INTO samples VALUES "
+        # B1: organism + sequence_type 共に値あり
+        "('B1', 'Homo sapiens', 2024, 't1', 'chip-atlas-hg38', 'run1', "
+        "'ChIP-Seq', NULL, 0), "
+        # B2: organism NULL, sequence_type 値あり
+        "('B2', NULL, 2024, 't2', 'chip-atlas-hg38', 'run1', 'ChIP-Seq', "
+        "NULL, 0), "
+        # B3: organism 値あり, sequence_type NULL
+        "('B3', 'Homo sapiens', 2024, 't3', 'chip-atlas-hg38', 'run1', NULL, "
+        "NULL, 0)"
+    )
+    con.execute(
+        "CREATE TABLE facts ("
+        "  accession VARCHAR, run_name VARCHAR, field VARCHAR, value VARCHAR, "
+        "  term_id VARCHAR, label VARCHAR, exact_match BOOLEAN, "
+        "  text2term_score FLOAT, ontology_source VARCHAR, extract_status VARCHAR"
+        ")"
+    )
+    con.execute(
+        "INSERT INTO facts VALUES "
+        "('B1', 'run1', 'disease', 'c', 'MONDO:1', 'neoplasm', TRUE, 1.0, "
+        "'MONDO', 'ok'), "
+        "('B2', 'run1', 'disease', 'c', 'MONDO:1', 'neoplasm', TRUE, 1.0, "
+        "'MONDO', 'ok'), "
+        "('B3', 'run1', 'disease', 'c', 'MONDO:1', 'neoplasm', TRUE, 1.0, "
+        "'MONDO', 'ok')"
+    )
+    return con
+
+
+def test_unknown_sentinel_in_organism_filter_includes_null_rows() -> None:
+    con = _connect_with_null_samples()
+    # organism_normalized=(UNKNOWN,) → NULL 行 (B2) のみが残る。
+    n = cohort_count(
+        con, SampleFilters(organism_normalized=(UNKNOWN,))
+    )
+    assert n == 1
+    # 「Homo sapiens」と UNKNOWN を両方選んだら NULL + 値ありの両方が拾える。
+    n_combined = cohort_count(
+        con,
+        SampleFilters(organism_normalized=("Homo sapiens", UNKNOWN)),
+    )
+    assert n_combined == 3
+
+
+def test_unknown_sentinel_in_sequence_type_filter_includes_null_rows() -> None:
+    con = _connect_with_null_samples()
+    # sequence_type=(UNKNOWN,) → NULL 行 (B3) のみ。
+    n = cohort_count(
+        con, SampleFilters(sequence_type=(UNKNOWN,))
+    )
+    assert n == 1
+    # ChIP-Seq + UNKNOWN で B1/B2 (ChIP-Seq) + B3 (NULL) の合計 3 件。
+    n_combined = cohort_count(
+        con, SampleFilters(sequence_type=("ChIP-Seq", UNKNOWN))
+    )
+    assert n_combined == 3
+
+
+# ---- overlay axis (gap_heatmap_pivot secondary_count) ----
+
+
+def test_gap_heatmap_pivot_overlay_axis_sequence_type(
+    aggregation_parquet_dir: Path,
+) -> None:
+    """``overlay_axis="seq:<value>"`` で secondary_count を seq 別に切り替えられる。
+
+    fixture では (MONDO:1, CHEBI:1) は A1 (ChIP-Seq) で構成されるので、
+    overlay_axis="seq:ChIP-Seq" のとき secondary_count == 1。
+    overlay_axis="seq:ATAC-Seq" だと A1 は ATAC-Seq ではないので 0。
+    """
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+
+    df = gap_heatmap_pivot(
+        con, "disease", "drug", SampleFilters(), overlay_axis="seq:ChIP-Seq"
+    )
+    row = df[
+        (df["x_term_id"] == "MONDO:1") & (df["y_term_id"] == "CHEBI:1")
+    ].iloc[0]
+    assert int(row["sample_count"]) == 1
+    assert int(row["secondary_count"]) == 1
+
+    df_atac = gap_heatmap_pivot(
+        con, "disease", "drug", SampleFilters(), overlay_axis="seq:ATAC-Seq"
+    )
+    row_atac = df_atac[
+        (df_atac["x_term_id"] == "MONDO:1") & (df_atac["y_term_id"] == "CHEBI:1")
+    ].iloc[0]
+    assert int(row_atac["sample_count"]) == 1
+    assert int(row_atac["secondary_count"]) == 0

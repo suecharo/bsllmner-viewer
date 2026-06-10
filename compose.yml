@@ -18,6 +18,10 @@ services:
       - BSLLMNER_VIEWER_LOG_LEVEL=${BSLLMNER_VIEWER_LOG_LEVEL:-info}
       - BSLLMNER_VIEWER_DATA_DIR=${BSLLMNER_VIEWER_DATA_DIR:-/app/data}
       - BSLLMNER_VIEWER_ONTOLOGY_DIR=/opt/bsllmner-mk2/ontology
+      # DuckDB tuning — 空 default なら PRAGMA を発行しない (lib/duckdb.py)
+      - BSLLMNER_VIEWER_DUCKDB_THREADS=${BSLLMNER_VIEWER_DUCKDB_THREADS:-}
+      - BSLLMNER_VIEWER_DUCKDB_MEMORY_LIMIT=${BSLLMNER_VIEWER_DUCKDB_MEMORY_LIMIT:-}
+      - BSLLMNER_VIEWER_DUCKDB_TEMP_DIR=${BSLLMNER_VIEWER_DUCKDB_TEMP_DIR:-}
       # uv runtime tuning (固定値、env file で上書き不可)
       - UV_PROJECT_ENVIRONMENT=/app/.venv
       - UV_LINK_MODE=copy

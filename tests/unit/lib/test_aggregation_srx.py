@@ -74,15 +74,16 @@ def test_cohort_srx_links_expands_to_one_row_per_srx(
     assert "A4" not in df["accession"].tolist()
 
 
-def test_cohort_srx_links_carries_chip_atlas_genome(
+def test_cohort_srx_links_carries_source_system(
     aggregation_parquet_dir: Path,
 ) -> None:
-    # A3 sits in source_system="src2" with chip_atlas_genome=None — UI uses
-    # this column to skip ChIP-Atlas BigWig links when genome is null.
+    # A3 は source_system="rnaseq-human" (ChIP-Atlas 系統ではない)。UI 側は
+    # この値を ``lib/chip_atlas.bigwig_url`` / ``peak_bed_url`` に渡し、
+    # ChIP-Atlas 系統に該当しないときに deep link を出さないかを判定する。
     con = get_conn(parquet_dir=aggregation_parquet_dir)
     df = cohort_srx_links(con, ["A3"])
     assert df["srx"].tolist() == ["SRX4"]
-    assert df["chip_atlas_genome"].tolist() == [None]
+    assert df["source_system"].tolist() == ["rnaseq-human"]
 
 
 def test_cohort_srx_links_limit_caps_srx_rows(
@@ -108,5 +109,5 @@ def test_cohort_srx_links_empty_accessions_returns_empty(
         "sra_study",
         "sra_sample",
         "status",
-        "chip_atlas_genome",
+        "source_system",
     ]

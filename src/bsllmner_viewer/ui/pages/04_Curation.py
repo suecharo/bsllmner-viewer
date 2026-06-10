@@ -15,6 +15,7 @@ from bsllmner_viewer.lib.aggregation import (
     mapping_status_matrix_fast,
     mapping_status_over_time,
     mapping_status_over_time_fast,
+    mixed_bs_srx_composition,
     raw_value_term_flow,
     top_unmapped_values,
 )
@@ -40,16 +41,14 @@ def _status_matrix(
     source: tuple[str, ...],
     year_min: int | None,
     year_max: int | None,
-    in_chip_atlas: bool | None,
     sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
-        organism_normalized=list(organism),
-        source_system=list(source),
+        organism_normalized=organism,
+        source_system=source,
         submission_year_min=year_min,
         submission_year_max=year_max,
-        in_chip_atlas=in_chip_atlas,
-        sequence_type=list(sequence_type),
+        sequence_type=sequence_type,
     )
     c = conn()
     if has_dashboard_aggregates(c):
@@ -63,16 +62,14 @@ def _status_over_time(
     source: tuple[str, ...],
     year_min: int | None,
     year_max: int | None,
-    in_chip_atlas: bool | None,
     sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
-        organism_normalized=list(organism),
-        source_system=list(source),
+        organism_normalized=organism,
+        source_system=source,
         submission_year_min=year_min,
         submission_year_max=year_max,
-        in_chip_atlas=in_chip_atlas,
-        sequence_type=list(sequence_type),
+        sequence_type=sequence_type,
     )
     c = conn()
     if has_dashboard_aggregates(c):
@@ -88,16 +85,14 @@ def _unmapped(
     source: tuple[str, ...],
     year_min: int | None,
     year_max: int | None,
-    in_chip_atlas: bool | None,
     sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
-        organism_normalized=list(organism),
-        source_system=list(source),
+        organism_normalized=organism,
+        source_system=source,
         submission_year_min=year_min,
         submission_year_max=year_max,
-        in_chip_atlas=in_chip_atlas,
-        sequence_type=list(sequence_type),
+        sequence_type=sequence_type,
     )
     return top_unmapped_values(conn(), field, top_n, f)
 
@@ -107,7 +102,6 @@ filter_key = (
     tuple(filters.source_system),
     filters.submission_year_min,
     filters.submission_year_max,
-    filters.in_chip_atlas,
     tuple(filters.sequence_type),
 )
 
@@ -384,16 +378,14 @@ def _flow(
     source: tuple[str, ...],
     year_min: int | None,
     year_max: int | None,
-    in_chip_atlas: bool | None,
     sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
-        organism_normalized=list(organism),
-        source_system=list(source),
+        organism_normalized=organism,
+        source_system=source,
         submission_year_min=year_min,
         submission_year_max=year_max,
-        in_chip_atlas=in_chip_atlas,
-        sequence_type=list(sequence_type),
+        sequence_type=sequence_type,
     )
     return raw_value_term_flow(conn(), field, top_n, f, min_count=min_count)
 
@@ -472,4 +464,90 @@ else:
         "Left = raw extracted values, right = ontology terms. A value with "
         "many outgoing links = mapping is ambiguous; a term with many "
         "incoming links = language is fragmented (curation candidate)."
+    )
+
+st.divider()
+
+# D7: Mixed BS の SRX-level 組成. samples.sequence_type='mixed' な BioSample に
+# ついて srx_links を accession + sequence_type で集約し、組成パターン (multiset)
+# を頻度別に並べる。samples 側で 'mixed' 1 ラベルに圧縮された情報を per-SRX
+# まで開いて curation 候補を浮かび上がらせる用途。
+st.subheader("Mixed BioSample SRX composition")
+mix_top_n = st.slider(
+    "Top N patterns",
+    min_value=5,
+    max_value=50,
+    value=20,
+    step=5,
+    key="curation_mix_top_n",
+)
+
+
+@st.cache_data(show_spinner="aggregating…")
+def _mixed_composition(
+    top_n: int,
+    organism: tuple[str, ...],
+    source: tuple[str, ...],
+    year_min: int | None,
+    year_max: int | None,
+    sequence_type: tuple[str, ...],
+) -> pd.DataFrame:
+    f = SampleFilters(
+        organism_normalized=organism,
+        source_system=source,
+        submission_year_min=year_min,
+        submission_year_max=year_max,
+        sequence_type=sequence_type,
+    )
+    return mixed_bs_srx_composition(conn(), f, top_n=top_n)
+
+
+mix_df = _mixed_composition(mix_top_n, *filter_key)
+if mix_df.empty:
+    st.info(
+        "No `mixed` BioSamples under the current filters, or `srx_links` has "
+        "no per-SRX sequence_type rows for them."
+    )
+else:
+    mix_df = mix_df.sort_values("n_bs", ascending=True)
+    col_bs, col_srx = st.columns(2)
+    with col_bs:
+        fig_d7_bs = px.bar(
+            mix_df,
+            x="n_bs",
+            y="pattern_label",
+            orientation="h",
+            labels={"n_bs": "BioSamples", "pattern_label": "SRX pattern"},
+        )
+        fig_d7_bs.update_layout(
+            height=max(320, 22 * len(mix_df)),
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_d7_bs,
+            width="stretch",
+            key=f"d7_bs_{filter_key}_{mix_top_n}",
+        )
+    with col_srx:
+        fig_d7_srx = px.bar(
+            mix_df,
+            x="n_srx",
+            y="pattern_label",
+            orientation="h",
+            labels={"n_srx": "SRX rows", "pattern_label": "SRX pattern"},
+        )
+        fig_d7_srx.update_layout(
+            height=max(320, 22 * len(mix_df)),
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(
+            fig_d7_srx,
+            width="stretch",
+            key=f"d7_srx_{filter_key}_{mix_top_n}",
+        )
+    st.caption(
+        "Each row is one composition pattern (e.g. `ChIP-Seq x2 + ATAC-Seq x1`). "
+        "`n_bs` = BioSamples carrying that pattern, `n_srx` = total SRX rows "
+        "across those BS. Recovers the per-SRX detail that `samples.sequence_type` "
+        "collapses to `mixed`."
     )

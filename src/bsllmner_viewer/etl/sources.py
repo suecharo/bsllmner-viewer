@@ -10,7 +10,10 @@ from bsllmner_viewer.etl.types import SourceSystemId
 class SourceSystem(BaseModel):
     """1 系統 (chip-atlas-hg38 / chip-atlas-mm10 / rnaseq-human) の定義。
 
-    docs/etl.md「入力 source」テーブルの行に対応。
+    docs/etl.md「入力 source」テーブルの行に対応。ChIP-Atlas 関連の派生情報
+    (in_chip_atlas / genome) はここに持たず、``lib/chip_atlas.py:
+    SOURCE_SYSTEM_TO_GENOME`` と ``is_chip_atlas_source(source_system)`` で
+    ``id`` から導出する (docs/data-model.md ChIP-Atlas 接続点 節)。
 
     ``default_sequence_type`` は ``samples.sequence_type`` の fallback。
     chip-atlas-* は per-SRX に ``experimentList.tab`` から正規化した
@@ -22,8 +25,6 @@ class SourceSystem(BaseModel):
 
     id: SourceSystemId
     organism: str
-    in_chip_atlas: bool
-    chip_atlas_genome: str | None
     default_sequence_type: str | None
     input_glob: str
     result_glob: str
@@ -35,8 +36,6 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
     SourceSystem(
         id="chip-atlas-hg38",
         organism="Homo sapiens",
-        in_chip_atlas=True,
-        chip_atlas_genome="hg38",
         default_sequence_type=None,
         input_glob="chip-atlas-hg38/input/bs_entries_hg38.jsonl",
         result_glob="chip-atlas-hg38/result/select_*.json",
@@ -45,8 +44,6 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
     SourceSystem(
         id="chip-atlas-mm10",
         organism="Mus musculus",
-        in_chip_atlas=True,
-        chip_atlas_genome="mm10",
         default_sequence_type=None,
         input_glob="chip-atlas-mm10/input/bs_entries_mm10.jsonl",
         result_glob="chip-atlas-mm10/result/select_*.json",
@@ -55,8 +52,6 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
     SourceSystem(
         id="rnaseq-human",
         organism="Homo sapiens",
-        in_chip_atlas=False,
-        chip_atlas_genome=None,
         default_sequence_type="RNA-Seq",
         input_glob="rnaseq-human/input/bs_entries_*.jsonl",
         result_glob="rnaseq-human/result/select_rnaseq_*.json",

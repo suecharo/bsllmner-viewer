@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Final
 
 import duckdb
@@ -20,6 +20,13 @@ VALID_FIELDS: Final[tuple[str, ...]] = (
     "overexpressed_gene",
 )
 
+# Sentinel that the UI (sidebar multiselect) and the agg parquet share to stand
+# in for NULL. samples.parquet keeps real NULLs; the live ``_filter_clauses``
+# expands ``UNKNOWN`` in an IN list to ``OR <col> IS NULL`` so the live and
+# agg paths return the same row set under any filter (docs/data-model.md
+# §"sequence_type の null/mixed/(unknown) 取扱").
+UNKNOWN: Final[str] = "(unknown)"
+
 # Per-field ontology used for hierarchy roll-up. Fields whose primary ontology
 # has no usable is-a hierarchy (Cellosaurus: self-loop only) or is not stored
 # in ontology.parquet (NCBI Gene) are intentionally absent — depth roll-up is
@@ -31,31 +38,70 @@ FIELD_TO_ONTOLOGY: Final[dict[str, str]] = {
     "drug": "ChEBI",
 }
 
+# Overlay axis predicates for ``gap_heatmap_pivot`` and other secondary_count
+# users. Key = ID shown to UI / persisted in session_state; value = (label,
+# SQL predicate with ``s.`` qualifier, extra params). The first entry is the
+# default. ``seq:<value>`` is recognised dynamically (see _overlay_predicate)
+# so adding a new sequence_type does not need a code change here.
+OVERLAY_AXES: Final[dict[str, tuple[str, str, tuple[object, ...]]]] = {
+    "chip_atlas": ("ChIP-Atlas", "s.source_system LIKE 'chip-atlas-%'", ()),
+}
+
 
 def can_roll_up(field_name: str) -> bool:
     return field_name in FIELD_TO_ONTOLOGY
 
 
-@dataclass
+def _overlay_predicate(overlay_axis: str | None) -> tuple[str, list[object]]:
+    if overlay_axis is None:
+        overlay_axis = next(iter(OVERLAY_AXES))
+    if overlay_axis.startswith("seq:"):
+        return "s.sequence_type = ?", [overlay_axis[4:]]
+    spec = OVERLAY_AXES.get(overlay_axis, OVERLAY_AXES[next(iter(OVERLAY_AXES))])
+    return spec[1], list(spec[2])
+
+
+@dataclass(frozen=True)
 class SampleFilters:
-    organism_normalized: list[str] = field(default_factory=list)
+    """Hashable snapshot of sidebar filter state.
+
+    ``@st.cache_data`` uses this object as a cache key directly because every
+    list-shaped field is a tuple and the dataclass is frozen. UI code MUST
+    pass tuples (not lists) when constructing.
+    """
+
+    organism_normalized: tuple[str, ...] = ()
     submission_year_min: int | None = None
     submission_year_max: int | None = None
-    source_system: list[str] = field(default_factory=list)
-    in_chip_atlas: bool | None = None
-    # Sequence assay の filter (ChIP-Seq / ATAC-Seq / DNase-Seq / Bisulfite-Seq /
-    # RNA-Seq / ChIP-Seq (input) / Annotation track / mixed)。samples.sequence_type
-    # 列の IN フィルタとして展開される。docs/data-model.md `sequence_type` 節を参照。
-    sequence_type: list[str] = field(default_factory=list)
+    source_system: tuple[str, ...] = ()
+    sequence_type: tuple[str, ...] = ()
+
+
+def _in_clause_with_unknown(
+    col_sql: str, values: tuple[str, ...]
+) -> tuple[str, list[object]]:
+    """IN clause that also matches NULL when ``UNKNOWN`` is part of ``values``.
+
+    Without the OR expansion the live path silently drops NULL rows whenever
+    any value is selected, while the agg path collapses NULL into ``UNKNOWN``
+    — the asymmetry behind QUA-1 / QUA-3.
+    """
+    placeholders = ",".join(["?"] * len(values))
+    base = f"{col_sql} IN ({placeholders})"
+    if UNKNOWN in values:
+        return f"({base} OR {col_sql} IS NULL)", list(values)
+    return base, list(values)
 
 
 def _filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
     if f.organism_normalized:
-        placeholders = ",".join(["?"] * len(f.organism_normalized))
-        clauses.append(f"s.organism_normalized IN ({placeholders})")
-        params.extend(f.organism_normalized)
+        clause, p = _in_clause_with_unknown(
+            "s.organism_normalized", f.organism_normalized
+        )
+        clauses.append(clause)
+        params.extend(p)
     if f.submission_year_min is not None:
         clauses.append("s.submission_year >= ?")
         params.append(f.submission_year_min)
@@ -63,16 +109,14 @@ def _filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
         clauses.append("s.submission_year <= ?")
         params.append(f.submission_year_max)
     if f.source_system:
+        # source_system has no NULLs by construction — plain IN.
         placeholders = ",".join(["?"] * len(f.source_system))
         clauses.append(f"s.source_system IN ({placeholders})")
         params.extend(f.source_system)
-    if f.in_chip_atlas is not None:
-        clauses.append("s.in_chip_atlas = ?")
-        params.append(f.in_chip_atlas)
     if f.sequence_type:
-        placeholders = ",".join(["?"] * len(f.sequence_type))
-        clauses.append(f"s.sequence_type IN ({placeholders})")
-        params.extend(f.sequence_type)
+        clause, p = _in_clause_with_unknown("s.sequence_type", f.sequence_type)
+        clauses.append(clause)
+        params.extend(p)
     if not clauses:
         return "TRUE", []
     return " AND ".join(clauses), params
@@ -163,11 +207,15 @@ def gap_heatmap_pivot(
     top_n_y: int = 30,
     x_roll_up_depth: int | None = None,
     y_roll_up_depth: int | None = None,
+    overlay_axis: str | None = None,
 ) -> pd.DataFrame:
     """Return a long-form DataFrame of (x_term, y_term) sample counts.
 
     Columns: ``x_term_id``, ``x_label``, ``y_term_id``, ``y_label``,
-    ``sample_count``, ``chip_atlas_count``.
+    ``sample_count``, ``secondary_count``. ``secondary_count`` is the
+    ``COUNT(DISTINCT accession)`` of rows that also match ``overlay_axis``
+    (default: ChIP-Atlas systems). See ``OVERLAY_AXES`` and the UI's
+    "Overlay axis" selector.
 
     ``x_roll_up_depth`` / ``y_roll_up_depth``: when set, replace each leaf
     term with ``MIN(parent_term_id)`` at that depth in the field's primary
@@ -176,12 +224,16 @@ def gap_heatmap_pivot(
 
     Only cells with sample_count > 0 are returned; the caller pivots and
     reindexes against the chosen axis term lists to surface empty cells.
+
+    The internal ``top_terms`` axis-selection runs against the fast path
+    (``top_terms_fast``) when ``has_dashboard_aggregates(con)`` and the field
+    has no roll-up, falling back to the live ``top_terms`` otherwise.
     """
     _validate_field(x_field)
     _validate_field(y_field)
 
-    x_pairs = top_terms(con, x_field, filters, top_n_x, x_roll_up_depth)
-    y_pairs = top_terms(con, y_field, filters, top_n_y, y_roll_up_depth)
+    x_pairs = _select_top_terms(con, x_field, filters, top_n_x, x_roll_up_depth)
+    y_pairs = _select_top_terms(con, y_field, filters, top_n_y, y_roll_up_depth)
     if not x_pairs or not y_pairs:
         return pd.DataFrame(
             columns=[
@@ -190,13 +242,14 @@ def gap_heatmap_pivot(
                 "y_term_id",
                 "y_label",
                 "sample_count",
-                "chip_atlas_count",
+                "secondary_count",
             ]
         )
 
     where_clause, where_params = _filter_clauses(filters)
     x_axis_sql, x_axis_params = _axis_facts_sql(x_field, x_roll_up_depth)
     y_axis_sql, y_axis_params = _axis_facts_sql(y_field, y_roll_up_depth)
+    overlay_sql, overlay_params = _overlay_predicate(overlay_axis)
     x_terms = [t for t, _ in x_pairs]
     y_terms = [t for t, _ in y_pairs]
     x_ph = ",".join(["?"] * len(x_terms))
@@ -207,7 +260,8 @@ def gap_heatmap_pivot(
         "SELECT fx.term_id AS x_term_id, ANY_VALUE(fx.label) AS x_label, "
         "       fy.term_id AS y_term_id, ANY_VALUE(fy.label) AS y_label, "
         "       COUNT(DISTINCT s.accession) AS sample_count, "
-        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) AS chip_atlas_count "
+        f"       COUNT(DISTINCT CASE WHEN {overlay_sql} THEN s.accession END) "
+        "         AS secondary_count "
         "FROM fx "
         "JOIN fy ON fx.accession = fy.accession AND fx.run_name = fy.run_name "
         "JOIN samples s ON s.accession = fx.accession AND s.run_name = fx.run_name "
@@ -217,12 +271,32 @@ def gap_heatmap_pivot(
     params: list[object] = [
         *x_axis_params,
         *y_axis_params,
+        *overlay_params,
         *x_terms,
         *y_terms,
         *where_params,
     ]
     df = con.execute(sql, params).fetchdf()
     return df
+
+
+def _select_top_terms(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    top_n: int,
+    roll_up_depth: int | None,
+) -> list[tuple[str, str]]:
+    """Pick the fast path when it's safe (no roll-up + agg parquet present).
+
+    The fast path is implemented by ``top_terms_fast`` (defined further down)
+    and uses ``agg_field_term_dims``. When the caller asks for a roll-up
+    depth, only the live ``top_terms`` knows how to walk the ontology, so we
+    keep the live call.
+    """
+    if roll_up_depth is None and has_dashboard_aggregates(con):
+        return top_terms_fast(con, field_name, filters, top_n)
+    return top_terms(con, field_name, filters, top_n, roll_up_depth)
 
 
 def _facts_terms_clauses(
@@ -308,7 +382,7 @@ def cohort_samples(
 
     sql = (
         "SELECT s.accession, s.organism_normalized, s.submission_year, "
-        "       s.title, s.source_system, s.in_chip_atlas, "
+        "       s.title, s.source_system, s.sequence_type, "
         "       s.srx_first AS srx, s.srx_count "
         "FROM samples s "
         f"WHERE {where_clause} "
@@ -325,7 +399,7 @@ _SRX_LINKS_COLS: Final[tuple[str, ...]] = (
     "sra_study",
     "sra_sample",
     "status",
-    "chip_atlas_genome",
+    "source_system",
 )
 
 
@@ -337,12 +411,12 @@ def cohort_srx_links(
     """Return per-SRX rows for the given BioSamples (1 row per SRX).
 
     Joins ``srx_links`` to ``samples`` so each per-SRX row carries
-    ``chip_atlas_genome`` (needed to build ChIP-Atlas deep links) without the
-    caller having to plumb it. Pre-filtering on the cohort's accession list
-    keeps the scan bounded.
+    ``source_system`` (the UI uses ``lib/chip_atlas.bigwig_url`` /
+    ``peak_bed_url`` to build deep links from that). Pre-filtering on the
+    cohort's accession list keeps the scan bounded.
 
     Columns: ``accession`` / ``srx`` / ``bioproject`` / ``sra_study`` /
-    ``sra_sample`` / ``status`` / ``chip_atlas_genome``.
+    ``sra_sample`` / ``status`` / ``source_system``.
 
     ``limit`` caps the SRX row count (default 500) so the UI never has to
     render an unbounded table.
@@ -351,7 +425,7 @@ def cohort_srx_links(
         return pd.DataFrame({c: pd.Series(dtype="object") for c in _SRX_LINKS_COLS})
     sql = (
         "SELECT sl.accession, sl.srx, sl.bioproject, sl.sra_study, "
-        "       sl.sra_sample, sl.status, s.chip_atlas_genome "
+        "       sl.sra_sample, sl.status, s.source_system "
         "FROM srx_links sl "
         "JOIN samples s ON s.accession = sl.accession "
         "WHERE sl.accession IN (SELECT UNNEST(?::VARCHAR[])) "
@@ -446,16 +520,18 @@ def term_sample_count(
     term_id: str,
     filters: SampleFilters,
 ) -> tuple[int, int]:
-    """Return ``(sample_count, chip_atlas_count)`` for a single (field, term_id).
+    """Return ``(sample_count, secondary_count)`` for a single (field, term_id).
 
     Counts are taken under the supplied ``SampleFilters``. Both values reflect
-    distinct ``s.accession``; the second narrows to ``s.in_chip_atlas``.
+    distinct ``s.accession``; ``secondary_count`` narrows to ChIP-Atlas
+    systems via ``source_system LIKE 'chip-atlas-%'`` (the default overlay).
     """
     _validate_field(field_name)
     where_clause, where_params = _filter_clauses(filters)
     sql = (
         "SELECT COUNT(DISTINCT s.accession), "
-        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) "
+        "       COUNT(DISTINCT CASE WHEN s.source_system LIKE 'chip-atlas-%' "
+        "         THEN s.accession END) "
         "FROM facts f "
         "JOIN samples s ON s.accession = f.accession AND s.run_name = f.run_name "
         f"WHERE f.field = ? AND f.term_id = ? AND {where_clause}"
@@ -478,15 +554,15 @@ def cumulative_bubble_dataset(
     Each ``(term_id, organism_normalized)`` group is reindexed against the full
     contiguous year range present in the underlying data and filled with 0
     where no rows exist, then ``cumsum`` is applied. Cumulative columns are
-    ``sample_count_cum`` / ``chip_atlas_count_cum``; the original
-    ``sample_count`` / ``chip_atlas_count`` per-year values are kept.
+    ``sample_count_cum`` / ``secondary_count_cum``; the original
+    ``sample_count`` / ``secondary_count`` per-year values are kept.
 
     ``roll_up_depth`` matches ``bubble_dataset`` — leaves are replaced with the
     ancestor at the requested depth in ``FIELD_TO_ONTOLOGY[field_name]`` before
     the per-year aggregation runs.
     """
     df = bubble_dataset(con, field_name, filters, top_n, roll_up_depth)
-    cum_columns = ["sample_count_cum", "chip_atlas_count_cum"]
+    cum_columns = ["sample_count_cum", "secondary_count_cum"]
     if df.empty:
         for col in cum_columns:
             df[col] = pd.Series(dtype="int64")
@@ -505,7 +581,7 @@ def cumulative_bubble_dataset(
         ["term_id", "organism_normalized"], sort=False
     ):
         sub = (
-            g[["submission_year", "sample_count", "chip_atlas_count"]]
+            g[["submission_year", "sample_count", "secondary_count"]]
             .set_index("submission_year")
             .reindex(full_years, fill_value=0)
         )
@@ -513,7 +589,7 @@ def cumulative_bubble_dataset(
         sub["organism_normalized"] = org
         sub["label"] = term_labels.get(term_id, term_id)
         sub["sample_count_cum"] = sub["sample_count"].cumsum()
-        sub["chip_atlas_count_cum"] = sub["chip_atlas_count"].cumsum()
+        sub["secondary_count_cum"] = sub["secondary_count"].cumsum()
         parts.append(sub.reset_index())
 
     return pd.concat(parts, ignore_index=True)
@@ -526,10 +602,12 @@ def bubble_dataset(
     top_n: int = 30,
     roll_up_depth: int | None = None,
 ) -> pd.DataFrame:
-    """Aggregate (year, term) → sample count, with chip-atlas overlay.
+    """Aggregate (year, term) → sample count, with a configurable overlay.
 
     Returns columns: ``submission_year``, ``term_id``, ``label``,
-    ``sample_count``, ``chip_atlas_count``, ``organism_normalized``.
+    ``sample_count``, ``secondary_count``, ``organism_normalized``.
+    ``secondary_count`` uses the default overlay axis (ChIP-Atlas systems).
+    Future work can plumb ``overlay_axis`` through ``OVERLAY_AXES`` here too.
 
     ``roll_up_depth``: when set, replace each leaf term with its
     ``MIN(parent_term_id)`` ancestor at that depth in
@@ -547,11 +625,12 @@ def bubble_dataset(
                 "label",
                 "organism_normalized",
                 "sample_count",
-                "chip_atlas_count",
+                "secondary_count",
             ]
         )
     where_clause, where_params = _filter_clauses(filters)
     axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
+    overlay_sql, overlay_params = _overlay_predicate(None)
     term_ids = [t for t, _ in top_pairs]
     term_ph = ",".join(["?"] * len(term_ids))
     sql = (
@@ -559,7 +638,8 @@ def bubble_dataset(
         "SELECT s.submission_year, fx.term_id, ANY_VALUE(fx.label) AS label, "
         "       s.organism_normalized, "
         "       COUNT(DISTINCT s.accession) AS sample_count, "
-        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) AS chip_atlas_count "
+        f"       COUNT(DISTINCT CASE WHEN {overlay_sql} THEN s.accession END) "
+        "         AS secondary_count "
         "FROM fx "
         "JOIN samples s ON s.accession = fx.accession AND s.run_name = fx.run_name "
         f"WHERE fx.term_id IN ({term_ph}) "
@@ -567,7 +647,12 @@ def bubble_dataset(
         "GROUP BY s.submission_year, fx.term_id, s.organism_normalized "
         "ORDER BY s.submission_year, fx.term_id"
     )
-    params: list[object] = [*axis_params, *term_ids, *where_params]
+    params: list[object] = [
+        *axis_params,
+        *overlay_params,
+        *term_ids,
+        *where_params,
+    ]
     return con.execute(sql, params).fetchdf()
 
 
@@ -601,8 +686,8 @@ def cohort_breakdown(
     sql = (
         "SELECT s.submission_year, s.organism_normalized, s.source_system, "
         "       COUNT(DISTINCT s.accession) AS sample_count, "
-        "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas THEN s.accession END) "
-        "       AS chip_atlas_count "
+        "       COUNT(DISTINCT CASE WHEN s.source_system LIKE 'chip-atlas-%' "
+        "         THEN s.accession END) AS secondary_count "
         "FROM samples s "
         f"WHERE {where_clause} "
         "GROUP BY s.submission_year, s.organism_normalized, s.source_system"
@@ -642,10 +727,11 @@ def has_dashboard_aggregates(con: duckdb.DuckDBPyConnection) -> bool:
 def _agg_filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
     """``_filter_clauses`` の agg 版 (samples 別名 ``s.`` を付けない)。
 
-    agg_*.parquet には dim 列が inline で乗っているので、samples を JOIN せずに
-    そのまま WHERE で絞り込める。``organism_normalized`` / ``sequence_type`` は
-    agg 側で ``'(unknown)'`` に塗り潰されているので、None の filter は (unknown)
-    も含めて素通しする (filter 指定があったときだけ完全一致 IN にする)。
+    agg_*.parquet には dim 列が inline で乗っており、NULL は ``UNKNOWN``
+    リテラルに塗り潰してある (``build_aggregates._build_agg_*``)。よって
+    UNKNOWN を含む IN リストは特別扱い不要で素直に IN するだけで live 版と
+    同じ集合を返す (docs/data-model.md §"sequence_type の null/mixed/(unknown)
+    取扱" の invariant)。
     """
     clauses: list[str] = []
     params: list[object] = []
@@ -663,9 +749,6 @@ def _agg_filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
         placeholders = ",".join(["?"] * len(f.source_system))
         clauses.append(f"source_system IN ({placeholders})")
         params.extend(f.source_system)
-    if f.in_chip_atlas is not None:
-        clauses.append("in_chip_atlas = ?")
-        params.append(f.in_chip_atlas)
     if f.sequence_type:
         placeholders = ",".join(["?"] * len(f.sequence_type))
         clauses.append(f"sequence_type IN ({placeholders})")
@@ -756,21 +839,28 @@ def top_terms_overall_fast(
 def summary_counts_fast(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     """Home 上部 metric cards: samples / chip_atlas / facts / runs / terms。
 
-    samples 系の 2 つは agg から導出する。runs/facts/ontology は view が存在
-    する時だけ COUNT(*) を取り、無い場合は 0 を返す (fixture 等の部分 dataset
-    でも壊れないため)。
+    samples / chip_atlas は agg_samples_by_dims から SUM で導出する。
+    runs / facts は parquet footer の ``num_rows`` を ``parquet_metadata`` で
+    引き、ファイル本体 (とくに 13.3M facts) を scan しない。terms は
+    DISTINCT が必要なので live COUNT (ontology は ~5.4M で実用上問題ない)。
+    parquet が無い deployment では各 metric を 0 にフォールバックする。
     """
+    from bsllmner_viewer.lib.duckdb import default_parquet_dir, parquet_path
+
     res: dict[str, int] = {}
     row = con.execute(
         "SELECT "
         "  COALESCE(SUM(sample_count), 0), "
-        "  COALESCE(SUM(CASE WHEN in_chip_atlas THEN sample_count END), 0) "
+        "  COALESCE("
+        "    SUM(CASE WHEN source_system LIKE 'chip-atlas-%' THEN sample_count END),"
+        "    0) "
         "FROM agg_samples_by_dims"
     ).fetchone()
     res["samples"] = int(row[0]) if row else 0
     res["chip_atlas"] = int(row[1]) if row else 0
-    res["runs"] = _scalar_count(con, "SELECT COUNT(*) FROM runs", "runs")
-    res["facts"] = _scalar_count(con, "SELECT COUNT(*) FROM facts", "facts")
+    pdir = default_parquet_dir()
+    res["runs"] = _parquet_num_rows(con, parquet_path("runs", pdir))
+    res["facts"] = _parquet_num_rows(con, parquet_path("facts", pdir))
     res["terms"] = _scalar_count(
         con, "SELECT COUNT(DISTINCT term_id) FROM ontology", "ontology"
     )
@@ -784,6 +874,24 @@ def _scalar_count(
         return 0
     row = con.execute(sql).fetchone()
     return int(row[0]) if row else 0
+
+
+def _parquet_num_rows(con: duckdb.DuckDBPyConnection, path: object) -> int:
+    """Return ``num_rows`` from a parquet footer without scanning the file.
+
+    Uses pyarrow's ``ParquetFile.metadata.num_rows`` which only reads the
+    footer (negligible IO compared to scanning the data). The DuckDB
+    connection is unused but kept for symmetry with ``_scalar_count``.
+    """
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    if not isinstance(path, Path) or not path.exists():
+        return 0
+    del con
+    parquet_file = pq.ParquetFile(str(path))  # type: ignore[no-untyped-call]
+    return int(parquet_file.metadata.num_rows)
 
 
 def mapping_status_matrix_fast(
@@ -865,7 +973,7 @@ def bubble_dataset_fast(
                 "label",
                 "organism_normalized",
                 "sample_count",
-                "chip_atlas_count",
+                "secondary_count",
             ]
         )
     where, params = _agg_filter_clauses(filters)
@@ -875,8 +983,8 @@ def bubble_dataset_fast(
         "SELECT submission_year, term_id, ANY_VALUE(label) AS label, "
         "       organism_normalized, "
         "       SUM(sample_count) AS sample_count, "
-        "       SUM(CASE WHEN in_chip_atlas THEN sample_count ELSE 0 END) "
-        "         AS chip_atlas_count "
+        "       SUM(CASE WHEN source_system LIKE 'chip-atlas-%' "
+        "         THEN sample_count ELSE 0 END) AS secondary_count "
         "FROM agg_field_term_dims "
         f"WHERE field = ? AND submission_year IS NOT NULL "
         f"  AND term_id IN ({term_ph}) AND {where} "
@@ -908,12 +1016,12 @@ def samples_by_year_source(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 def samples_by_organism(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """``organism_normalized`` → sample_count for the Home F2 donut."""
     return con.execute(
-        "SELECT COALESCE(organism_normalized, '(unknown)') "
-        "       AS organism_normalized, "
+        "SELECT COALESCE(organism_normalized, ?) AS organism_normalized, "
         "       COUNT(DISTINCT accession) AS sample_count "
         "FROM samples "
         "GROUP BY 1 "
-        "ORDER BY sample_count DESC"
+        "ORDER BY sample_count DESC",
+        [UNKNOWN],
     ).fetchdf()
 
 
@@ -924,6 +1032,22 @@ def samples_by_source(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         "FROM samples "
         "GROUP BY source_system "
         "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def samples_by_sequence_type(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """``sequence_type`` → sample_count for the Home F2 donut.
+
+    NULL is collapsed to ``UNKNOWN`` so the live and fast paths return the
+    same slice set under the sentinel invariant.
+    """
+    return con.execute(
+        "SELECT COALESCE(sequence_type, ?) AS sequence_type, "
+        "       COUNT(DISTINCT accession) AS sample_count "
+        "FROM samples "
+        "GROUP BY 1 "
+        "ORDER BY sample_count DESC",
+        [UNKNOWN],
     ).fetchdf()
 
 
@@ -1071,6 +1195,71 @@ def raw_value_term_flow(
         "LIMIT ?",
         [field_name, *where_params, min_count, top_n],
     ).fetchdf()
+
+
+def mixed_bs_srx_composition(
+    con: duckdb.DuckDBPyConnection,
+    filters: SampleFilters,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """SRX-level sequence_type composition of ``mixed`` BioSamples — Curation D7.
+
+    Restricts to BioSamples whose ``samples.sequence_type = 'mixed'`` (under
+    ``filters``), joins ``srx_links`` per accession, and counts SRX rows per
+    ``(accession, sequence_type)``. Each BioSample's per-type counts are then
+    sorted by ``sequence_type`` and serialised into a deterministic pattern
+    string (e.g. ``"ATAC-Seq x1 + ChIP-Seq x2"``). Patterns are grouped to
+    return the Top N by ``n_bs``.
+
+    Columns: ``pattern`` (tuple-of-(seq, n) JSON-ish string used as the
+    grouping key), ``pattern_label`` (human-readable label), ``n_bs``
+    (distinct BioSamples carrying the pattern), ``n_srx`` (total SRX rows
+    summed across those BioSamples). SRX rows whose ``sequence_type`` is NULL
+    are collapsed into ``UNKNOWN`` so they remain visible rather than silently
+    dropping the BioSample from the composition view.
+    """
+    where_clause, where_params = _filter_clauses(filters)
+    sql = (
+        "WITH bs AS ("
+        "  SELECT DISTINCT s.accession FROM samples s "
+        f"  WHERE s.sequence_type = 'mixed' AND {where_clause}"
+        "), "
+        "per_acc_type AS ("
+        "  SELECT sl.accession, COALESCE(sl.sequence_type, ?) AS seq, "
+        "         COUNT(*) AS n "
+        "  FROM srx_links sl "
+        "  WHERE sl.accession IN (SELECT accession FROM bs) "
+        "  GROUP BY sl.accession, COALESCE(sl.sequence_type, ?)"
+        "), "
+        "per_acc AS ("
+        "  SELECT accession, "
+        "         STRING_AGG(seq || ' x' || n, ' + ' ORDER BY seq) "
+        "           AS pattern_label, "
+        "         SUM(n) AS srx_total "
+        "  FROM per_acc_type "
+        "  GROUP BY accession"
+        ") "
+        "SELECT pattern_label, "
+        "       COUNT(DISTINCT accession) AS n_bs, "
+        "       SUM(srx_total) AS n_srx "
+        "FROM per_acc "
+        "GROUP BY pattern_label "
+        "ORDER BY n_bs DESC, n_srx DESC "
+        "LIMIT ?"
+    )
+    df = con.execute(
+        sql, [*where_params, UNKNOWN, UNKNOWN, top_n]
+    ).fetchdf()
+    cols = ["pattern", "pattern_label", "n_bs", "n_srx"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    # ``pattern`` is a stable machine-friendly key in case callers want to
+    # join back; for now it's identical to ``pattern_label`` (SQL already
+    # sorted seq alphabetically inside STRING_AGG).
+    df["pattern"] = df["pattern_label"]
+    df["n_bs"] = df["n_bs"].astype(int)
+    df["n_srx"] = df["n_srx"].astype(int)
+    return df[cols].reset_index(drop=True)
 
 
 # ---- Gapminder Tier 2 (Momentum / Diversity / Concentration / Hierarchy) ----
@@ -1322,7 +1511,7 @@ def term_hierarchy_breakdown(
         "label",
         "depth",
         "sample_count",
-        "chip_atlas_count",
+        "secondary_count",
     ]
     cols = (["submission_year", *base_cols]) if by_year else base_cols
     if not can_roll_up(field_name):
@@ -1402,13 +1591,14 @@ def term_hierarchy_breakdown(
 
     where_clause, where_params = _filter_clauses(filters)
     axis_sql, axis_params = _axis_facts_sql(field_name, roll_up_depth)
+    overlay_sql, overlay_params = _overlay_predicate(None)
     if by_year:
         agg_sql = (
             f"WITH fx AS ({axis_sql}) "
             "SELECT fx.term_id, s.submission_year, "
             "       COUNT(DISTINCT s.accession) AS sample_count, "
-            "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas "
-            "         THEN s.accession END) AS chip_atlas_count "
+            f"       COUNT(DISTINCT CASE WHEN {overlay_sql} "
+            "         THEN s.accession END) AS secondary_count "
             "FROM fx "
             "JOIN samples s ON s.accession = fx.accession "
             "  AND s.run_name = fx.run_name "
@@ -1421,8 +1611,8 @@ def term_hierarchy_breakdown(
             f"WITH fx AS ({axis_sql}) "
             "SELECT fx.term_id, "
             "       COUNT(DISTINCT s.accession) AS sample_count, "
-            "       COUNT(DISTINCT CASE WHEN s.in_chip_atlas "
-            "         THEN s.accession END) AS chip_atlas_count "
+            f"       COUNT(DISTINCT CASE WHEN {overlay_sql} "
+            "         THEN s.accession END) AS secondary_count "
             "FROM fx "
             "JOIN samples s ON s.accession = fx.accession "
             "  AND s.run_name = fx.run_name "
@@ -1430,7 +1620,7 @@ def term_hierarchy_breakdown(
             "GROUP BY fx.term_id"
         )
     counts = con.execute(
-        agg_sql, [*axis_params, *term_ids, *where_params]
+        agg_sql, [*axis_params, *overlay_params, *term_ids, *where_params]
     ).fetchdf()
     if counts.empty:
         return pd.DataFrame(columns=cols)
@@ -1445,7 +1635,7 @@ def term_hierarchy_breakdown(
         counts["term_id"].map(lambda t: depth_by_term.get(str(t), 0)).astype(int)
     )
     counts["sample_count"] = counts["sample_count"].astype(int)
-    counts["chip_atlas_count"] = counts["chip_atlas_count"].astype(int)
+    counts["secondary_count"] = counts["secondary_count"].astype(int)
     if by_year:
         counts["submission_year"] = counts["submission_year"].astype(int)
     return counts[cols].reset_index(drop=True)

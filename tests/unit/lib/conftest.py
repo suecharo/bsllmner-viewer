@@ -83,8 +83,6 @@ _SAMPLES_SCHEMA = pa.schema(
         pa.field("title", pa.string(), nullable=True),
         pa.field("source_system", pa.string(), nullable=False),
         pa.field("run_name", pa.string(), nullable=False),
-        pa.field("in_chip_atlas", pa.bool_(), nullable=False),
-        pa.field("chip_atlas_genome", pa.string(), nullable=True),
         pa.field("sequence_type", pa.string(), nullable=True),
         pa.field("srx_first", pa.string(), nullable=True),
         pa.field("srx_count", pa.int32(), nullable=False),
@@ -110,18 +108,21 @@ _FACTS_SCHEMA = pa.schema(
 _SAMPLES_ROWS = [
     # 最後の列が sequence_type。A1/A2 を ChIP-Seq、A4/A5 を ATAC-Seq、A3 を RNA-Seq
     # にして、aggregation tests で seq filter の通り道が確認できるようにしてある。
+    # source_system は chip-atlas-* / rnaseq-human を直接使い、overlay 軸
+    # (s.source_system LIKE 'chip-atlas-%') の secondary_count を実物どおりに
+    # 検証できるようにする。
     ("A1", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A1",
-     "src1", "run1", True, "hg38", "ChIP-Seq"),
+     "chip-atlas-hg38", "run1", "ChIP-Seq"),
     ("A2", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A2",
-     "src1", "run1", True, "hg38", "ChIP-Seq"),
+     "chip-atlas-hg38", "run1", "ChIP-Seq"),
     ("A3", "Mus musculus", "Mus musculus", 2025, "PRJ2", "Sample A3",
-     "src2", "run2", False, None, "RNA-Seq"),
+     "rnaseq-human", "run2", "RNA-Seq"),
     # A4 / A5 carry leaf MONDO terms one level below the root, used by
     # the depth=0 roll-up tests.
     ("A4", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A4",
-     "src1", "run1", True, "hg38", "ATAC-Seq"),
+     "chip-atlas-hg38", "run1", "ATAC-Seq"),
     ("A5", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A5",
-     "src1", "run1", True, "hg38", "ATAC-Seq"),
+     "chip-atlas-hg38", "run1", "ATAC-Seq"),
 ]
 
 _FACTS_ROWS = [
@@ -172,7 +173,7 @@ _SRX_LINKS_SCHEMA = pa.schema(
 # Per-BioSample SRX topology used by per-SRX expansion + cohort_samples tests:
 #   A1 -> 2 SRX (multi)
 #   A2 -> 1 SRX
-#   A3 -> 1 SRX (in_chip_atlas=False BS)
+#   A3 -> 1 SRX (rnaseq-human source — non-ChIP-Atlas BS)
 #   A4 -> 0 SRX  (covers "BS without any SRX" path; INNER JOIN drops it)
 #   A5 -> 3 SRX (multi, with mixed status to exercise status-passthrough)
 _SRX_ROWS = [

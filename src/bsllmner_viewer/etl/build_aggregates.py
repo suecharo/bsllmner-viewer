@@ -7,11 +7,11 @@ facts JOIN を 2 回、Home F3/F5 でも facts スキャン)。これらの quer
 
 cardinality 上限:
 
-| ファイル                       | row 上限 (実測 << 上限)                                |
-|-------------------------------|-------------------------------------------------------|
-| agg_samples_by_dims.parquet   | 30 yr × 3 src × 8 seq × 6 org × 2 chip ≈ 8.6K         |
-| agg_field_term_dims.parquet   | top 200/field × yr × src × seq × org × chip × 8 fields, sparse |
-| agg_field_status_dims.parquet | 8 field × 3 src × 8 seq × 30 yr × 3 status ≈ 17K      |
+| ファイル                       | row 上限 (実測 << 上限)                          |
+|-------------------------------|--------------------------------------------------|
+| agg_samples_by_dims.parquet   | 30 yr × 3 src × 8 seq × 6 org ≈ 4.3K             |
+| agg_field_term_dims.parquet   | top 200/field × yr × src × seq × org × 8 fields, sparse |
+| agg_field_status_dims.parquet | 8 field × 3 src × 8 seq × 30 yr × 3 status ≈ 17K |
 
 実 data でも数 MB ずつに収まり、Streamlit cold-start は数十 ms オーダになる。
 """
@@ -41,11 +41,13 @@ def _parquet_columns(con: duckdb.DuckDBPyConnection, path: Path) -> set[str]:
 
 
 def _build_agg_samples(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
-    """(submission_year, source_system, sequence_type, organism_normalized,
-    in_chip_atlas) → sample_count。
+    """(submission_year, source_system, sequence_type, organism_normalized)
+    → sample_count。
 
     Home F1/F2/F4、cohort_breakdown (no facts predicate)、samples_by_*、
-    cohort 画面の mini histogram の base になる。
+    cohort 画面の mini histogram の base になる。``source_system`` から
+    ChIP-Atlas 派生 (`source_system LIKE 'chip-atlas-%'`) が取れるので
+    旧 in_chip_atlas 列は持たない (docs/data-model.md ChIP-Atlas 接続点 節)。
     """
     sql = (
         "COPY ("
@@ -54,10 +56,9 @@ def _build_agg_samples(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
         "    source_system, "
         "    COALESCE(sequence_type, '(unknown)') AS sequence_type, "
         "    COALESCE(organism_normalized, '(unknown)') AS organism_normalized, "
-        "    in_chip_atlas, "
         "    COUNT(DISTINCT accession) AS sample_count "
         "  FROM samples "
-        "  GROUP BY 1, 2, 3, 4, 5"
+        "  GROUP BY 1, 2, 3, 4"
         f") TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
     )
     con.execute(sql)
@@ -67,7 +68,7 @@ def _build_agg_samples(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
 
 def _build_agg_field_term_dims(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
     """(field, term_id, label, submission_year, source_system, sequence_type,
-    organism_normalized, in_chip_atlas) → sample_count。
+    organism_normalized) → sample_count。
 
     各 field で sample_count 上位 N term だけ残す。bubble_dataset /
     cumulative_bubble_dataset / momentum_dataset / cumulative_diversity /
@@ -80,7 +81,7 @@ def _build_agg_field_term_dims(con: duckdb.DuckDBPyConnection, out_path: Path) -
         "         s.submission_year, s.source_system, "
         "         COALESCE(s.sequence_type, '(unknown)') AS sequence_type, "
         "         COALESCE(s.organism_normalized, '(unknown)') AS organism_normalized, "
-        "         s.in_chip_atlas, s.accession "
+        "         s.accession "
         "  FROM facts f "
         "  JOIN samples s ON s.accession = f.accession "
         "    AND s.run_name = f.run_name "
@@ -100,12 +101,12 @@ def _build_agg_field_term_dims(con: duckdb.DuckDBPyConnection, out_path: Path) -
         ") "
         "SELECT j.field, j.term_id, ANY_VALUE(j.label) AS label, "
         "       j.submission_year, j.source_system, j.sequence_type, "
-        "       j.organism_normalized, j.in_chip_atlas, "
+        "       j.organism_normalized, "
         "       COUNT(DISTINCT j.accession) AS sample_count "
         "FROM joined j "
         "JOIN kept k ON k.field = j.field AND k.term_id = j.term_id "
         "GROUP BY j.field, j.term_id, j.submission_year, j.source_system, "
-        "         j.sequence_type, j.organism_normalized, j.in_chip_atlas"
+        "         j.sequence_type, j.organism_normalized"
     )
     df = con.execute(sql, [_TOP_TERMS_PER_FIELD]).fetchdf()
     df.to_parquet(out_path, compression="zstd", index=False)
@@ -118,13 +119,14 @@ def _build_agg_field_term_dims(con: duckdb.DuckDBPyConnection, out_path: Path) -
 
 
 def _build_agg_field_status(con: duckdb.DuckDBPyConnection, out_path: Path) -> None:
-    """(field, source_system, sequence_type, submission_year, organism_normalized,
-    in_chip_atlas, extract_status) → n。
+    """(field, source_system, sequence_type, submission_year,
+    organism_normalized, extract_status) → n。
 
-    Home F3/F4 + Curation D1 (status × source matrix) + D2 (status × year line) の
-    base。``n`` は fact-row count。``organism_normalized`` / ``in_chip_atlas`` も
-    含めることで sidebar の全 filter (organism / year / source / chip-atlas /
-    sequence_type) で WHERE 絞りができる。
+    Home F3/F4 + Curation D1 (status × source matrix) + D2 (status × year
+    line) の base。``n`` は fact-row count。``organism_normalized`` も
+    含めることで sidebar の全 filter (organism / year / source /
+    sequence_type) で WHERE 絞りができる。ChIP-Atlas 派生は
+    ``source_system LIKE 'chip-atlas-%'`` で取り出す。
     """
     sql = (
         "COPY ("
@@ -132,12 +134,12 @@ def _build_agg_field_status(con: duckdb.DuckDBPyConnection, out_path: Path) -> N
         "         COALESCE(s.sequence_type, '(unknown)') AS sequence_type, "
         "         s.submission_year, "
         "         COALESCE(s.organism_normalized, '(unknown)') AS organism_normalized, "
-        "         s.in_chip_atlas, f.extract_status, "
+        "         f.extract_status, "
         "         COUNT(*) AS n "
         "  FROM facts f "
         "  JOIN samples s ON s.accession = f.accession "
         "    AND s.run_name = f.run_name "
-        "  GROUP BY 1, 2, 3, 4, 5, 6, 7"
+        "  GROUP BY 1, 2, 3, 4, 5, 6"
         f") TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
     )
     con.execute(sql)
