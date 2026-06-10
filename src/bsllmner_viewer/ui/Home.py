@@ -7,10 +7,18 @@ import streamlit as st
 from bsllmner_viewer.lib.aggregation import (
     VALID_FIELDS,
     field_facts_status,
+    field_facts_status_fast,
+    has_dashboard_aggregates,
     samples_by_organism,
+    samples_by_organism_fast,
+    samples_by_sequence_type_fast,
     samples_by_source,
+    samples_by_source_fast,
     samples_by_year_source,
+    samples_by_year_source_fast,
+    summary_counts_fast,
     top_terms_overall,
+    top_terms_overall_fast,
 )
 from bsllmner_viewer.ui._conn import conn
 
@@ -27,6 +35,8 @@ con = conn()
 @st.cache_data(show_spinner=False)
 def _summary() -> dict[str, int]:
     c = conn()
+    if has_dashboard_aggregates(c):
+        return summary_counts_fast(c)
     n_samples = c.execute("SELECT COUNT(*) FROM samples").fetchone()
     n_runs = c.execute("SELECT COUNT(*) FROM runs").fetchone()
     n_facts = c.execute("SELECT COUNT(*) FROM facts").fetchone()
@@ -56,30 +66,55 @@ col_e.metric("Ontology terms", f"{summary['terms']:,}")
 
 
 # Filter-free dashboard aggregates — cached separately so toggling Top-N field
-# (F5) doesn't re-run F1/F2/F3.
+# (F5) doesn't re-run F1/F2/F3. fast=True なら build-aggregates が生成した
+# 小さい agg view を読む (cold-start ~10ms vs 13M facts scan)。
 @st.cache_data(show_spinner=False)
 def _yearly() -> pd.DataFrame:
-    return samples_by_year_source(conn())
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return samples_by_year_source_fast(c)
+    return samples_by_year_source(c)
 
 
 @st.cache_data(show_spinner=False)
 def _organisms() -> pd.DataFrame:
-    return samples_by_organism(conn())
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return samples_by_organism_fast(c)
+    return samples_by_organism(c)
 
 
 @st.cache_data(show_spinner=False)
 def _sources() -> pd.DataFrame:
-    return samples_by_source(conn())
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return samples_by_source_fast(c)
+    return samples_by_source(c)
+
+
+@st.cache_data(show_spinner=False)
+def _seq_types() -> pd.DataFrame | None:
+    """sequence_type 別 sample 数 donut の data。agg 不在時は None。"""
+    c = conn()
+    if not has_dashboard_aggregates(c):
+        return None
+    return samples_by_sequence_type_fast(c)
 
 
 @st.cache_data(show_spinner=False)
 def _status_matrix() -> pd.DataFrame:
-    return field_facts_status(conn())
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return field_facts_status_fast(c)
+    return field_facts_status(c)
 
 
 @st.cache_data(show_spinner=False)
 def _top_terms(field: str, top_n: int) -> pd.DataFrame:
-    return top_terms_overall(conn(), field, top_n)
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return top_terms_overall_fast(c, field, top_n)
+    return top_terms_overall(c, field, top_n)
 
 
 # F1: Yearly submission trend
@@ -105,10 +140,12 @@ else:
     )
     st.plotly_chart(fig_year, width="stretch", key="home_yearly")
 
-# F2: Organism + Source donuts
-st.subheader("Organism / source split")
-col_org, col_src = st.columns(2)
-with col_org:
+# F2: Organism + Source + Sequence type donuts
+st.subheader("Organism / source / sequence type split")
+seq_df = _seq_types()
+n_cols = 3 if seq_df is not None and not seq_df.empty else 2
+cols = st.columns(n_cols)
+with cols[0]:
     org_df = _organisms()
     if org_df.empty:
         st.caption("No organism data.")
@@ -125,7 +162,7 @@ with col_org:
             modebar={"remove": ["fullscreen", "togglefullscreen"]},
         )
         st.plotly_chart(fig_org, width="stretch", key="home_org_donut")
-with col_src:
+with cols[1]:
     src_df = _sources()
     if src_df.empty:
         st.caption("No source data.")
@@ -142,6 +179,20 @@ with col_src:
             modebar={"remove": ["fullscreen", "togglefullscreen"]},
         )
         st.plotly_chart(fig_src, width="stretch", key="home_src_donut")
+if n_cols == 3 and seq_df is not None and not seq_df.empty:
+    with cols[2]:
+        fig_seq = px.pie(
+            seq_df,
+            names="sequence_type",
+            values="sample_count",
+            hole=0.5,
+            title="Sequence type",
+        )
+        fig_seq.update_layout(
+            height=320,
+            modebar={"remove": ["fullscreen", "togglefullscreen"]},
+        )
+        st.plotly_chart(fig_seq, width="stretch", key="home_seq_donut")
 
 # F3 + F4: Mapping success
 st.subheader("Mapping quality")

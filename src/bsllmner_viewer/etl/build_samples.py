@@ -29,6 +29,7 @@ _SCHEMA = pa.schema(
         pa.field("run_name", pa.string(), nullable=False),
         pa.field("in_chip_atlas", pa.bool_(), nullable=False),
         pa.field("chip_atlas_genome", pa.string(), nullable=True),
+        pa.field("sequence_type", pa.string(), nullable=True),
         pa.field("srx_first", pa.string(), nullable=True),
         pa.field("srx_count", pa.int32(), nullable=False),
     ]
@@ -68,6 +69,11 @@ def _make_row(
         "run_name": run_name,
         "in_chip_atlas": source.in_chip_atlas,
         "chip_atlas_genome": source.chip_atlas_genome,
+        # sequence_type は build-srx-links が experimentList.tab cache を読んで
+        # per-SRX seq_type を combine してから上書きする。cache が無い系統 /
+        # cache 不在のときは source.default_sequence_type で埋まったまま残る
+        # (rnaseq-human は "RNA-Seq"、chip-atlas-* は None)。
+        "sequence_type": source.default_sequence_type,
         # SRX columns start empty — `build-srx-links` enriches samples.parquet
         # in-place after the SRA_Accessions scan, populating these from the
         # accession ↔ SRX mapping.

@@ -11,6 +11,11 @@ class SourceSystem(BaseModel):
     """1 系統 (chip-atlas-hg38 / chip-atlas-mm10 / rnaseq-human) の定義。
 
     docs/etl.md「入力 source」テーブルの行に対応。
+
+    ``default_sequence_type`` は ``samples.sequence_type`` の fallback。
+    chip-atlas-* は per-SRX に ``experimentList.tab`` から正規化した
+    sequence_type を入れる前提で None。rnaseq-human は BS dump の選別段で
+    既に RNA-Seq に絞っているため ``"RNA-Seq"`` を default にする。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -19,6 +24,7 @@ class SourceSystem(BaseModel):
     organism: str
     in_chip_atlas: bool
     chip_atlas_genome: str | None
+    default_sequence_type: str | None
     input_glob: str
     result_glob: str
     input_is_wrapped: bool
@@ -31,6 +37,7 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         organism="Homo sapiens",
         in_chip_atlas=True,
         chip_atlas_genome="hg38",
+        default_sequence_type=None,
         input_glob="chip-atlas-hg38/input/bs_entries_hg38.jsonl",
         result_glob="chip-atlas-hg38/result/select_*.json",
         input_is_wrapped=False,
@@ -40,6 +47,7 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         organism="Mus musculus",
         in_chip_atlas=True,
         chip_atlas_genome="mm10",
+        default_sequence_type=None,
         input_glob="chip-atlas-mm10/input/bs_entries_mm10.jsonl",
         result_glob="chip-atlas-mm10/result/select_*.json",
         input_is_wrapped=False,
@@ -49,6 +57,7 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         organism="Homo sapiens",
         in_chip_atlas=False,
         chip_atlas_genome=None,
+        default_sequence_type="RNA-Seq",
         input_glob="rnaseq-human/input/bs_entries_*.jsonl",
         result_glob="rnaseq-human/result/select_rnaseq_*.json",
         input_is_wrapped=True,

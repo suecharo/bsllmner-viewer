@@ -85,6 +85,7 @@ _SAMPLES_SCHEMA = pa.schema(
         pa.field("run_name", pa.string(), nullable=False),
         pa.field("in_chip_atlas", pa.bool_(), nullable=False),
         pa.field("chip_atlas_genome", pa.string(), nullable=True),
+        pa.field("sequence_type", pa.string(), nullable=True),
         pa.field("srx_first", pa.string(), nullable=True),
         pa.field("srx_count", pa.int32(), nullable=False),
     ]
@@ -107,18 +108,20 @@ _FACTS_SCHEMA = pa.schema(
 
 
 _SAMPLES_ROWS = [
+    # 最後の列が sequence_type。A1/A2 を ChIP-Seq、A4/A5 を ATAC-Seq、A3 を RNA-Seq
+    # にして、aggregation tests で seq filter の通り道が確認できるようにしてある。
     ("A1", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A1",
-     "src1", "run1", True, "hg38"),
+     "src1", "run1", True, "hg38", "ChIP-Seq"),
     ("A2", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A2",
-     "src1", "run1", True, "hg38"),
+     "src1", "run1", True, "hg38", "ChIP-Seq"),
     ("A3", "Mus musculus", "Mus musculus", 2025, "PRJ2", "Sample A3",
-     "src2", "run2", False, None),
+     "src2", "run2", False, None, "RNA-Seq"),
     # A4 / A5 carry leaf MONDO terms one level below the root, used by
     # the depth=0 roll-up tests.
     ("A4", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A4",
-     "src1", "run1", True, "hg38"),
+     "src1", "run1", True, "hg38", "ATAC-Seq"),
     ("A5", "Homo sapiens", "Homo sapiens", 2024, "PRJ1", "Sample A5",
-     "src1", "run1", True, "hg38"),
+     "src1", "run1", True, "hg38", "ATAC-Seq"),
 ]
 
 _FACTS_ROWS = [
@@ -162,6 +165,7 @@ _SRX_LINKS_SCHEMA = pa.schema(
         pa.field("sra_study", pa.string(), nullable=True),
         pa.field("sra_sample", pa.string(), nullable=True),
         pa.field("status", pa.string(), nullable=False),
+        pa.field("sequence_type", pa.string(), nullable=True),
     ]
 )
 
@@ -172,13 +176,13 @@ _SRX_LINKS_SCHEMA = pa.schema(
 #   A4 -> 0 SRX  (covers "BS without any SRX" path; INNER JOIN drops it)
 #   A5 -> 3 SRX (multi, with mixed status to exercise status-passthrough)
 _SRX_ROWS = [
-    ("SRX1", "A1", "PRJ1", "SRP1", "SRS1", "live"),
-    ("SRX2", "A1", "PRJ1", "SRP1", "SRS1", "live"),
-    ("SRX3", "A2", "PRJ1", "SRP1", "SRS2", "live"),
-    ("SRX4", "A3", "PRJ2", "SRP2", "SRS3", "live"),
-    ("SRX5", "A5", "PRJ1", "SRP1", "SRS5", "live"),
-    ("SRX6", "A5", "PRJ1", "SRP1", "SRS5", "suppressed"),
-    ("SRX7", "A5", "PRJ1", "SRP1", "SRS5", "live"),
+    ("SRX1", "A1", "PRJ1", "SRP1", "SRS1", "live", "ChIP-Seq"),
+    ("SRX2", "A1", "PRJ1", "SRP1", "SRS1", "live", "ChIP-Seq"),
+    ("SRX3", "A2", "PRJ1", "SRP1", "SRS2", "live", "ChIP-Seq"),
+    ("SRX4", "A3", "PRJ2", "SRP2", "SRS3", "live", "RNA-Seq"),
+    ("SRX5", "A5", "PRJ1", "SRP1", "SRS5", "live", "ATAC-Seq"),
+    ("SRX6", "A5", "PRJ1", "SRP1", "SRS5", "suppressed", "ATAC-Seq"),
+    ("SRX7", "A5", "PRJ1", "SRP1", "SRS5", "live", "ATAC-Seq"),
 ]
 
 
@@ -191,7 +195,7 @@ def aggregation_parquet_dir(fixture_parquet_dir: Path) -> Path:
     # consistent with the standalone srx_links.parquet fixture.
     srx_first_by_acc: dict[str, str] = {}
     srx_count_by_acc: dict[str, int] = {}
-    for srx, acc, _bp, _study, _sample, _status in _SRX_ROWS:
+    for srx, acc, _bp, _study, _sample, _status, _seq in _SRX_ROWS:
         srx_count_by_acc[acc] = srx_count_by_acc.get(acc, 0) + 1
         existing = srx_first_by_acc.get(acc)
         if existing is None or srx < existing:

@@ -10,10 +10,12 @@ from bsllmner_viewer.lib.aggregation import (
     VALID_FIELDS,
     SampleFilters,
     bubble_dataset,
+    bubble_dataset_fast,
     can_roll_up,
     concentration_over_time,
     cumulative_bubble_dataset,
     cumulative_diversity,
+    has_dashboard_aggregates,
     momentum_dataset,
     term_hierarchy_breakdown,
 )
@@ -132,6 +134,7 @@ def _load(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    sequence_type: tuple[str, ...],
     roll_up_depth: int | None,
 ) -> pd.DataFrame:
     f = SampleFilters(
@@ -140,20 +143,66 @@ def _load(
         submission_year_min=year_min,
         submission_year_max=year_max,
         in_chip_atlas=in_chip_atlas,
+        sequence_type=list(sequence_type),
     )
+    c = conn()
+    # fast path: agg_field_term_dims (small parquet) を読む。roll_up_depth が
+    # 指定されている場合は ontology rollup が必要なので live を呼ぶ。
+    use_fast = roll_up_depth is None and has_dashboard_aggregates(c)
     if mode == "Cumulative":
-        df = cumulative_bubble_dataset(
-            conn(), field_name, f, top_n, roll_up_depth=roll_up_depth
-        )
+        if use_fast:
+            base = bubble_dataset_fast(c, field_name, f, top_n)
+            df = _cumulate(base)
+        else:
+            df = cumulative_bubble_dataset(
+                c, field_name, f, top_n, roll_up_depth=roll_up_depth
+            )
         df["count"] = df["sample_count_cum"]
         df["chip_count"] = df["chip_atlas_count_cum"]
     else:
-        df = bubble_dataset(
-            conn(), field_name, f, top_n, roll_up_depth=roll_up_depth
-        )
+        if use_fast:
+            df = bubble_dataset_fast(c, field_name, f, top_n)
+        else:
+            df = bubble_dataset(
+                c, field_name, f, top_n, roll_up_depth=roll_up_depth
+            )
         df["count"] = df["sample_count"]
         df["chip_count"] = df["chip_atlas_count"]
     return df
+
+
+def _cumulate(df: pd.DataFrame) -> pd.DataFrame:
+    """``bubble_dataset_fast`` の戻り (年毎) を ``cumulative_bubble_dataset`` 形式
+    (累積) に変換する純関数。
+    """
+    cum_cols = ["sample_count_cum", "chip_atlas_count_cum"]
+    if df.empty:
+        for col in cum_cols:
+            df[col] = pd.Series(dtype="int64")
+        return df
+    df = df.copy()
+    df["submission_year"] = df["submission_year"].astype(int)
+    years = sorted(df["submission_year"].unique())
+    full_years = list(range(min(years), max(years) + 1))
+    term_labels = (
+        df.drop_duplicates("term_id").set_index("term_id")["label"].to_dict()
+    )
+    parts: list[pd.DataFrame] = []
+    for (term_id, org), g in df.groupby(
+        ["term_id", "organism_normalized"], sort=False
+    ):
+        sub = (
+            g[["submission_year", "sample_count", "chip_atlas_count"]]
+            .set_index("submission_year")
+            .reindex(full_years, fill_value=0)
+        )
+        sub["term_id"] = term_id
+        sub["organism_normalized"] = org
+        sub["label"] = term_labels.get(term_id, term_id)
+        sub["sample_count_cum"] = sub["sample_count"].cumsum()
+        sub["chip_atlas_count_cum"] = sub["chip_atlas_count"].cumsum()
+        parts.append(sub.reset_index())
+    return pd.concat(parts, ignore_index=True)
 
 
 df = _load(
@@ -165,6 +214,7 @@ df = _load(
     filters.submission_year_min,
     filters.submission_year_max,
     filters.in_chip_atlas,
+    tuple(filters.sequence_type),
     roll_up_depth,
 )
 

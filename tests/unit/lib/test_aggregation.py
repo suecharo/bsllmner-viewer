@@ -1208,3 +1208,54 @@ def test_cohort_term_overlap_default_fields(
     assert set(df["field"]) == set(VALID_FIELDS)
 
 
+
+
+# ---- sequence_type filter ----
+
+
+def test_top_terms_respects_sequence_type_filter(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # A1/A2 are ChIP-Seq → MONDO:1; A4/A5 are ATAC-Seq → MONDO:10/11; A3 is RNA-Seq → MONDO:2.
+    pairs = top_terms(
+        con,
+        "disease",
+        SampleFilters(sequence_type=["ATAC-Seq"]),
+        top_n=10,
+    )
+    assert sorted(t for t, _ in pairs) == ["MONDO:10", "MONDO:11"]
+
+
+def test_cohort_count_with_sequence_type_filter(
+    aggregation_parquet_dir: Path,
+) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    n = cohort_count(con, SampleFilters(sequence_type=["RNA-Seq"]))
+    # A3 のみ RNA-Seq
+    assert n == 1
+
+
+def test_filter_clauses_emits_sequence_type_in_list() -> None:
+    from bsllmner_viewer.lib.aggregation import _filter_clauses
+
+    clause, params = _filter_clauses(
+        SampleFilters(sequence_type=["ChIP-Seq", "ATAC-Seq"])
+    )
+    assert "s.sequence_type IN (?,?)" in clause
+    assert params == ["ChIP-Seq", "ATAC-Seq"]
+
+
+def test_top_terms_combination_filter(aggregation_parquet_dir: Path) -> None:
+    con = get_conn(parquet_dir=aggregation_parquet_dir)
+    # ChIP-Seq + Homo sapiens で A1/A2 (MONDO:1) のみ。
+    pairs = top_terms(
+        con,
+        "disease",
+        SampleFilters(
+            sequence_type=["ChIP-Seq"],
+            organism_normalized=["Homo sapiens"],
+        ),
+        top_n=10,
+    )
+    assert pairs == [("MONDO:1", "neoplasm")]

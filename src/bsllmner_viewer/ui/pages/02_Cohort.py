@@ -74,6 +74,9 @@ if facts_cells:
 if filters_default is not None and "cohort_seeded" not in st.session_state:
     st.session_state["filter_organism"] = filters_default.organism_normalized
     st.session_state["filter_source"] = filters_default.source_system
+    st.session_state["filter_sequence_type"] = (
+        filters_default.sequence_type
+    )
     if filters_default.in_chip_atlas is True:
         st.session_state["filter_chip_atlas"] = "Only ChIP-Atlas"
     elif filters_default.in_chip_atlas is False:

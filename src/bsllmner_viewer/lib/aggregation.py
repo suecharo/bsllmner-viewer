@@ -43,6 +43,10 @@ class SampleFilters:
     submission_year_max: int | None = None
     source_system: list[str] = field(default_factory=list)
     in_chip_atlas: bool | None = None
+    # Sequence assay の filter (ChIP-Seq / ATAC-Seq / DNase-Seq / Bisulfite-Seq /
+    # RNA-Seq / ChIP-Seq (input) / Annotation track / mixed)。samples.sequence_type
+    # 列の IN フィルタとして展開される。docs/data-model.md `sequence_type` 節を参照。
+    sequence_type: list[str] = field(default_factory=list)
 
 
 def _filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
@@ -65,6 +69,10 @@ def _filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
     if f.in_chip_atlas is not None:
         clauses.append("s.in_chip_atlas = ?")
         params.append(f.in_chip_atlas)
+    if f.sequence_type:
+        placeholders = ",".join(["?"] * len(f.sequence_type))
+        clauses.append(f"s.sequence_type IN ({placeholders})")
+        params.extend(f.sequence_type)
     if not clauses:
         return "TRUE", []
     return " AND ".join(clauses), params
@@ -600,6 +608,282 @@ def cohort_breakdown(
         "GROUP BY s.submission_year, s.organism_normalized, s.source_system"
     )
     return con.execute(sql, base_params).fetchdf()
+
+
+# ---- Fast paths backed by build_aggregates' agg_*.parquet ----
+#
+# 各関数は対応する agg_*.parquet 経由で集計する。これらは UI cold-start で
+# 13.3M facts.parquet を再スキャンするのを避け、~10K 行の agg view を読むだけで
+# 同じ結果を返す。agg parquet が未生成 (live deployment 直後など) のときは
+# 呼び出し側で fallback (元の live 関数) を選ぶ。
+#
+# ``_filter_clauses`` は ``samples`` を ``s`` 別名で組み立てるため、agg view 側でも
+# ``s`` 別名で参照できるよう FROM 句で ``AS s`` を付ける。
+
+
+def _has_view(con: duckdb.DuckDBPyConnection, name: str) -> bool:
+    row = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = ? AND table_schema = 'main'",
+        [name],
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def has_dashboard_aggregates(con: duckdb.DuckDBPyConnection) -> bool:
+    """``build-aggregates`` が走っていて、Home/Curation の fast path が使える状態か。"""
+    return (
+        _has_view(con, "agg_samples_by_dims")
+        and _has_view(con, "agg_field_term_dims")
+        and _has_view(con, "agg_field_status_dims")
+    )
+
+
+def _agg_filter_clauses(f: SampleFilters) -> tuple[str, list[object]]:
+    """``_filter_clauses`` の agg 版 (samples 別名 ``s.`` を付けない)。
+
+    agg_*.parquet には dim 列が inline で乗っているので、samples を JOIN せずに
+    そのまま WHERE で絞り込める。``organism_normalized`` / ``sequence_type`` は
+    agg 側で ``'(unknown)'`` に塗り潰されているので、None の filter は (unknown)
+    も含めて素通しする (filter 指定があったときだけ完全一致 IN にする)。
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if f.organism_normalized:
+        placeholders = ",".join(["?"] * len(f.organism_normalized))
+        clauses.append(f"organism_normalized IN ({placeholders})")
+        params.extend(f.organism_normalized)
+    if f.submission_year_min is not None:
+        clauses.append("submission_year >= ?")
+        params.append(f.submission_year_min)
+    if f.submission_year_max is not None:
+        clauses.append("submission_year <= ?")
+        params.append(f.submission_year_max)
+    if f.source_system:
+        placeholders = ",".join(["?"] * len(f.source_system))
+        clauses.append(f"source_system IN ({placeholders})")
+        params.extend(f.source_system)
+    if f.in_chip_atlas is not None:
+        clauses.append("in_chip_atlas = ?")
+        params.append(f.in_chip_atlas)
+    if f.sequence_type:
+        placeholders = ",".join(["?"] * len(f.sequence_type))
+        clauses.append(f"sequence_type IN ({placeholders})")
+        params.extend(f.sequence_type)
+    if not clauses:
+        return "TRUE", []
+    return " AND ".join(clauses), params
+
+
+def samples_by_year_source_fast(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Home F1: 年次積み上げ。agg_samples_by_dims を SUM するだけ。"""
+    return con.execute(
+        "SELECT submission_year, source_system, "
+        "       SUM(sample_count) AS sample_count "
+        "FROM agg_samples_by_dims "
+        "WHERE submission_year IS NOT NULL "
+        "GROUP BY submission_year, source_system "
+        "ORDER BY submission_year, source_system"
+    ).fetchdf()
+
+
+def samples_by_organism_fast(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Home F2 donut: organism 別 sample 数。"""
+    return con.execute(
+        "SELECT organism_normalized, "
+        "       SUM(sample_count) AS sample_count "
+        "FROM agg_samples_by_dims "
+        "GROUP BY organism_normalized "
+        "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def samples_by_source_fast(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Home F2 donut: source_system 別 sample 数。"""
+    return con.execute(
+        "SELECT source_system, "
+        "       SUM(sample_count) AS sample_count "
+        "FROM agg_samples_by_dims "
+        "GROUP BY source_system "
+        "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def samples_by_sequence_type_fast(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Home: sequence_type 別 sample 数 (build-aggregates の派生)。"""
+    return con.execute(
+        "SELECT sequence_type, "
+        "       SUM(sample_count) AS sample_count "
+        "FROM agg_samples_by_dims "
+        "GROUP BY sequence_type "
+        "ORDER BY sample_count DESC"
+    ).fetchdf()
+
+
+def field_facts_status_fast(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Home F3/F4: (field, extract_status) → n。"""
+    return con.execute(
+        "SELECT field, extract_status, SUM(n) AS n "
+        "FROM agg_field_status_dims "
+        "GROUP BY field, extract_status "
+        "ORDER BY field, extract_status"
+    ).fetchdf()
+
+
+def top_terms_overall_fast(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    top_n: int,
+) -> pd.DataFrame:
+    """Home F5 Pareto: agg_field_term_dims からの SUM TopN。
+
+    ``label`` は agg parquet では最終 ANY_VALUE 済みなので 1 値しか無いはず
+    だが、念のため ANY_VALUE を取る。
+    """
+    _validate_field(field_name)
+    return con.execute(
+        "SELECT term_id, ANY_VALUE(label) AS label, "
+        "       SUM(sample_count) AS sample_count "
+        "FROM agg_field_term_dims "
+        "WHERE field = ? "
+        "GROUP BY term_id "
+        "ORDER BY sample_count DESC "
+        "LIMIT ?",
+        [field_name, top_n],
+    ).fetchdf()
+
+
+def summary_counts_fast(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
+    """Home 上部 metric cards: samples / chip_atlas / facts / runs / terms。
+
+    samples 系の 2 つは agg から導出する。runs/facts/ontology は view が存在
+    する時だけ COUNT(*) を取り、無い場合は 0 を返す (fixture 等の部分 dataset
+    でも壊れないため)。
+    """
+    res: dict[str, int] = {}
+    row = con.execute(
+        "SELECT "
+        "  COALESCE(SUM(sample_count), 0), "
+        "  COALESCE(SUM(CASE WHEN in_chip_atlas THEN sample_count END), 0) "
+        "FROM agg_samples_by_dims"
+    ).fetchone()
+    res["samples"] = int(row[0]) if row else 0
+    res["chip_atlas"] = int(row[1]) if row else 0
+    res["runs"] = _scalar_count(con, "SELECT COUNT(*) FROM runs", "runs")
+    res["facts"] = _scalar_count(con, "SELECT COUNT(*) FROM facts", "facts")
+    res["terms"] = _scalar_count(
+        con, "SELECT COUNT(DISTINCT term_id) FROM ontology", "ontology"
+    )
+    return res
+
+
+def _scalar_count(
+    con: duckdb.DuckDBPyConnection, sql: str, view_name: str
+) -> int:
+    if not _has_view(con, view_name):
+        return 0
+    row = con.execute(sql).fetchone()
+    return int(row[0]) if row else 0
+
+
+def mapping_status_matrix_fast(
+    con: duckdb.DuckDBPyConnection, filters: SampleFilters
+) -> pd.DataFrame:
+    """Curation D1 fast path: agg_field_status_dims を WHERE 絞りで SUM。"""
+    where, params = _agg_filter_clauses(filters)
+    return con.execute(
+        "SELECT field, source_system, extract_status, SUM(n) AS n "
+        "FROM agg_field_status_dims "
+        f"WHERE {where} "
+        "GROUP BY field, source_system, extract_status "
+        "ORDER BY field, source_system, extract_status",
+        params,
+    ).fetchdf()
+
+
+def mapping_status_over_time_fast(
+    con: duckdb.DuckDBPyConnection, filters: SampleFilters
+) -> pd.DataFrame:
+    """Curation D2 fast path: agg_field_status_dims から (field, year, status) → sum n。"""
+    where, params = _agg_filter_clauses(filters)
+    return con.execute(
+        "SELECT field, submission_year, extract_status, SUM(n) AS n "
+        "FROM agg_field_status_dims "
+        f"WHERE submission_year IS NOT NULL AND {where} "
+        "GROUP BY field, submission_year, extract_status "
+        "ORDER BY field, submission_year, extract_status",
+        params,
+    ).fetchdf()
+
+
+def top_terms_fast(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    top_n: int,
+) -> list[tuple[str, str]]:
+    """``top_terms`` の agg 経由版。``roll_up_depth`` は無視 (leaf レベル top のみ)。
+
+    Gapminder / Home F5 / Gap Discovery の最初の top_terms 呼出を高速化する。
+    roll-up が必要な呼出 (Gap Discovery の depth picker) は live ``top_terms``
+    側にそのまま流れる前提。
+    """
+    _validate_field(field_name)
+    where, params = _agg_filter_clauses(filters)
+    rows = con.execute(
+        "SELECT term_id, ANY_VALUE(label) AS lbl, "
+        "       SUM(sample_count) AS total "
+        "FROM agg_field_term_dims "
+        f"WHERE field = ? AND {where} "
+        "GROUP BY term_id "
+        "ORDER BY total DESC, term_id "
+        "LIMIT ?",
+        [field_name, *params, top_n],
+    ).fetchall()
+    return [(str(r[0]), str(r[1]) if r[1] is not None else str(r[0])) for r in rows]
+
+
+def bubble_dataset_fast(
+    con: duckdb.DuckDBPyConnection,
+    field_name: str,
+    filters: SampleFilters,
+    top_n: int = 30,
+) -> pd.DataFrame:
+    """``bubble_dataset`` の agg 経由版。
+
+    agg_field_term_dims から top N term を選び、(year, term, organism) で
+    SUM して同形の DataFrame を返す。``roll_up_depth`` 未対応 (leaf のみ)。
+    live 版と返り値の列名・型を揃える。
+    """
+    _validate_field(field_name)
+    top_pairs = top_terms_fast(con, field_name, filters, top_n)
+    if not top_pairs:
+        return pd.DataFrame(
+            columns=[
+                "submission_year",
+                "term_id",
+                "label",
+                "organism_normalized",
+                "sample_count",
+                "chip_atlas_count",
+            ]
+        )
+    where, params = _agg_filter_clauses(filters)
+    term_ids = [t for t, _ in top_pairs]
+    term_ph = ",".join(["?"] * len(term_ids))
+    return con.execute(
+        "SELECT submission_year, term_id, ANY_VALUE(label) AS label, "
+        "       organism_normalized, "
+        "       SUM(sample_count) AS sample_count, "
+        "       SUM(CASE WHEN in_chip_atlas THEN sample_count ELSE 0 END) "
+        "         AS chip_atlas_count "
+        "FROM agg_field_term_dims "
+        f"WHERE field = ? AND submission_year IS NOT NULL "
+        f"  AND term_id IN ({term_ph}) AND {where} "
+        "GROUP BY submission_year, term_id, organism_normalized "
+        "ORDER BY submission_year, term_id",
+        [field_name, *term_ids, *params],
+    ).fetchdf()
 
 
 # ---- Home dashboard helpers (filter-free, full-dataset aggregates) ----

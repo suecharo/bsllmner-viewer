@@ -10,8 +10,11 @@ import streamlit as st
 from bsllmner_viewer.lib.aggregation import (
     VALID_FIELDS,
     SampleFilters,
+    has_dashboard_aggregates,
     mapping_status_matrix,
+    mapping_status_matrix_fast,
     mapping_status_over_time,
+    mapping_status_over_time_fast,
     raw_value_term_flow,
     top_unmapped_values,
 )
@@ -38,6 +41,7 @@ def _status_matrix(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
         organism_normalized=list(organism),
@@ -45,8 +49,12 @@ def _status_matrix(
         submission_year_min=year_min,
         submission_year_max=year_max,
         in_chip_atlas=in_chip_atlas,
+        sequence_type=list(sequence_type),
     )
-    return mapping_status_matrix(conn(), f)
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return mapping_status_matrix_fast(c, f)
+    return mapping_status_matrix(c, f)
 
 
 @st.cache_data(show_spinner="aggregating…")
@@ -56,6 +64,7 @@ def _status_over_time(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
         organism_normalized=list(organism),
@@ -63,8 +72,12 @@ def _status_over_time(
         submission_year_min=year_min,
         submission_year_max=year_max,
         in_chip_atlas=in_chip_atlas,
+        sequence_type=list(sequence_type),
     )
-    return mapping_status_over_time(conn(), f)
+    c = conn()
+    if has_dashboard_aggregates(c):
+        return mapping_status_over_time_fast(c, f)
+    return mapping_status_over_time(c, f)
 
 
 @st.cache_data(show_spinner="aggregating…")
@@ -76,6 +89,7 @@ def _unmapped(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
         organism_normalized=list(organism),
@@ -83,6 +97,7 @@ def _unmapped(
         submission_year_min=year_min,
         submission_year_max=year_max,
         in_chip_atlas=in_chip_atlas,
+        sequence_type=list(sequence_type),
     )
     return top_unmapped_values(conn(), field, top_n, f)
 
@@ -93,6 +108,7 @@ filter_key = (
     filters.submission_year_min,
     filters.submission_year_max,
     filters.in_chip_atlas,
+    tuple(filters.sequence_type),
 )
 
 # D1: Mapping status heatmap (field × source_system) with ok-rate color.
@@ -369,6 +385,7 @@ def _flow(
     year_min: int | None,
     year_max: int | None,
     in_chip_atlas: bool | None,
+    sequence_type: tuple[str, ...],
 ) -> pd.DataFrame:
     f = SampleFilters(
         organism_normalized=list(organism),
@@ -376,6 +393,7 @@ def _flow(
         submission_year_min=year_min,
         submission_year_max=year_max,
         in_chip_atlas=in_chip_atlas,
+        sequence_type=list(sequence_type),
     )
     return raw_value_term_flow(conn(), field, top_n, f, min_count=min_count)
 

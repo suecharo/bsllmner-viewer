@@ -5,6 +5,7 @@ from typing import Annotated, cast, get_args
 
 import typer
 
+from bsllmner_viewer.etl.build_aggregates import build_aggregates
 from bsllmner_viewer.etl.build_facts import build_facts
 from bsllmner_viewer.etl.build_ontology import build_ontology
 from bsllmner_viewer.etl.build_runs import build_runs
@@ -41,6 +42,10 @@ def _default_out_dir() -> Path:
 
 def _default_sra_accessions_tab() -> Path:
     return _default_data_dir() / "cache" / "SRA_Accessions.tab"
+
+
+def _default_chip_atlas_experiment_list_tab() -> Path:
+    return _default_data_dir() / "cache" / "experimentList.tab"
 
 
 SourceOption = Annotated[
@@ -124,16 +129,42 @@ def cmd_build_srx_links(
     source_tab: Annotated[
         Path, typer.Option("--source-tab", "-t")
     ] = _default_sra_accessions_tab(),
+    experiment_list_tab: Annotated[
+        Path, typer.Option(
+            "--experiment-list-tab",
+            "-e",
+            help="ChIP-Atlas experimentList.tab cache (per-SRX sequence_type を埋める用)。"
+            "存在しなければ skip。",
+        )
+    ] = _default_chip_atlas_experiment_list_tab(),
     samples_path: Annotated[Path | None, typer.Option("--samples-path")] = None,
 ) -> None:
     """NCBI SRA_Accessions.tab を読み srx_links.parquet を生成する。
 
     `scripts/fetch_sra_accessions.py` で事前 download した cache を読む。
     samples.parquet にある BioSample に紐づく SRX のみ採用する。
+
+    ``--experiment-list-tab`` (default: ``data/cache/experimentList.tab``、
+    ``scripts/fetch_chip_atlas_experiment_list.py`` で download) が存在すれば
+    per-SRX に ``sequence_type`` 列も入れる。
     """
     _setup_logging()
     samples = samples_path if samples_path is not None else out_dir / "samples.parquet"
-    build_srx_links(source_tab, samples, out_dir / "srx_links.parquet")
+    build_srx_links(
+        source_tab,
+        samples,
+        out_dir / "srx_links.parquet",
+        experiment_list_tab=experiment_list_tab if experiment_list_tab.exists() else None,
+    )
+
+
+@app.command("build-aggregates")
+def cmd_build_aggregates(
+    out_dir: Annotated[Path, typer.Option("--out-dir", "-o")] = _default_out_dir(),
+) -> None:
+    """samples + facts から起動高速化用の agg_*.parquet を生成する。"""
+    _setup_logging()
+    build_aggregates(out_dir)
 
 
 @app.command("build-all")
@@ -146,11 +177,15 @@ def cmd_build_all(
     source_tab: Annotated[
         Path, typer.Option("--source-tab", "-t")
     ] = _default_sra_accessions_tab(),
+    experiment_list_tab: Annotated[
+        Path, typer.Option("--experiment-list-tab", "-e")
+    ] = _default_chip_atlas_experiment_list_tab(),
     source_systems: SourceOption = None,
 ) -> None:
     """runs → samples → facts → ontology → srx-links を依存順で全部生成する。
 
     `--source-tab` の cache が存在しない場合は srx-links のみ skip する。
+    `--experiment-list-tab` も同様に存在しなければ seq_type 列だけ skip。
     """
     _setup_logging()
     source_tuple = _source_tuple(source_systems)
@@ -159,13 +194,22 @@ def cmd_build_all(
     build_facts(data_dir, out_dir / "facts.parquet", source_tuple)
     build_ontology(ontology_dir, out_dir / "ontology.parquet", None)
     if source_tab.exists():
-        build_srx_links(source_tab, out_dir / "samples.parquet", out_dir / "srx_links.parquet")
+        build_srx_links(
+            source_tab,
+            out_dir / "samples.parquet",
+            out_dir / "srx_links.parquet",
+            experiment_list_tab=(
+                experiment_list_tab if experiment_list_tab.exists() else None
+            ),
+        )
     else:
         logging.getLogger(__name__).warning(
             "skipping build-srx-links: %s does not exist "
             "(run scripts/fetch_sra_accessions.py first)",
             source_tab,
         )
+    # 起動高速化 agg を最後に生成 (sequence_type enrich 後の samples.parquet を読む)。
+    build_aggregates(out_dir)
 
 
 if __name__ == "__main__":
