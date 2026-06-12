@@ -8,7 +8,6 @@ services:
     volumes:
       - .:/app:rw
       - app-venv:/app/.venv:rw
-      - ${BSLLMNER_VIEWER_BSLLMNER_MK2_ONTOLOGY_DIR}:/opt/bsllmner-mk2/ontology:ro
     ports:
       - "${BSLLMNER_VIEWER_APP_PORT}:${BSLLMNER_VIEWER_APP_INTERNAL_PORT}"
     environment:
@@ -17,7 +16,7 @@ services:
       - BSLLMNER_VIEWER_APP_INTERNAL_PORT=${BSLLMNER_VIEWER_APP_INTERNAL_PORT}
       - BSLLMNER_VIEWER_LOG_LEVEL=${BSLLMNER_VIEWER_LOG_LEVEL:-info}
       - BSLLMNER_VIEWER_DATA_DIR=${BSLLMNER_VIEWER_DATA_DIR:-/app/data}
-      - BSLLMNER_VIEWER_ONTOLOGY_DIR=/opt/bsllmner-mk2/ontology
+      - BSLLMNER_VIEWER_ONTOLOGY_DIR=${BSLLMNER_VIEWER_ONTOLOGY_DIR:-/app/data/ontology}
       # DuckDB tuning — 空 default なら PRAGMA を発行しない (lib/duckdb.py)
       - BSLLMNER_VIEWER_DUCKDB_THREADS=${BSLLMNER_VIEWER_DUCKDB_THREADS:-}
       - BSLLMNER_VIEWER_DUCKDB_MEMORY_LIMIT=${BSLLMNER_VIEWER_DUCKDB_MEMORY_LIMIT:-}

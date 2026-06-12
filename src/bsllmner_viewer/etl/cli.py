@@ -31,9 +31,10 @@ def _default_data_dir() -> Path:
 
 
 def _default_ontology_dir() -> Path:
-    return Path(
-        os.environ.get("BSLLMNER_VIEWER_ONTOLOGY_DIR", "/opt/bsllmner-mk2/ontology")
-    )
+    explicit = os.environ.get("BSLLMNER_VIEWER_ONTOLOGY_DIR")
+    if explicit:
+        return Path(explicit)
+    return _default_data_dir() / "ontology"
 
 
 def _default_out_dir() -> Path:

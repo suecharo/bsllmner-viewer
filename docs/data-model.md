@@ -131,15 +131,17 @@ extraction 失敗 / mapping 失敗の row も必ず保持する（curation repor
 
 ### 対象 ontology と source ファイル
 
-bsllmner-mk2 の `ontology/` を read-only bind mount で参照する。subset OWL は **term の集合と label を定義する側**、フル OWL は **hierarchy（`rdfs:subClassOf`）を提供する側**。subset OWL は bsllmner-mk2 が text2term の検索範囲を絞るために生成したもので、親クラスへの参照は剥がされている（`rdfs:subClassOf` が 0 件）。そのため bsllmner-viewer は subset から term_id / label を取り、hierarchy はフル OWL から補完する。
+`${BSLLMNER_VIEWER_ONTOLOGY_DIR}/` (default `data/ontology/`) 直下に subset / フル両 OWL を揃える。subset OWL は **term の集合と label を定義する側**、フル OWL は **hierarchy（`rdfs:subClassOf`）を提供する側**。subset OWL は text2term の検索範囲を絞るために CONSTRUCT クエリで切り出したもので、親クラスへの参照は剥がされている（`rdfs:subClassOf` が 0 件）。そのため bsllmner-viewer は subset から term_id / label を取り、hierarchy はフル OWL から補完する。
+
+upstream OWL の download は `scripts/fetch_ontology_owls.py`、subset OWL の生成は `scripts/build_ontology_subsets.sh` (host で実行、`obolibrary/robot:latest` を `docker run` で呼ぶ)。詳細手順は [`docs/etl.md`](etl.md) §「Ontology OWL」を参照。
 
 | ontology_source | subset (term_id + label の source) | hierarchy (`rdfs:subClassOf` の source) | 備考 |
 |---|---|---|---|
-| `Cellosaurus` | `cellosaurus.owl` | `cellosaurus.owl` | subset を持たないので「全体 = subset」扱い。272MB。Cellosaurus の `rdfs:subClassOf` は **すべて `owl:Restriction` 経由の意味的関係** (`derived_from` / `originate_from_same_individual_as` 等) であり、直接の is-a 階層を持たない設計なので、本 ETL では parent edges が 0 件 = 全 term が self-loop のみ (`depth=0`) になる。これは bug ではなく Cellosaurus の仕様 |
-| `CL` | `cl_human_subset.owl` + `cl_mouse_subset.owl` を union | `cl.owl` | |
+| `Cellosaurus` | `cellosaurus.owl` | `cellosaurus.owl` | subset を持たないので「全体 = subset」扱い。upstream `cellosaurus.obo` を `build_ontology_subsets.sh` 内で ROBOT convert して生成 (~272 MB)。Cellosaurus の `rdfs:subClassOf` は **すべて `owl:Restriction` 経由の意味的関係** (`derived_from` / `originate_from_same_individual_as` 等) であり、直接の is-a 階層を持たない設計なので、本 ETL では parent edges が 0 件 = 全 term が self-loop のみ (`depth=0`) になる。これは bug ではなく Cellosaurus の仕様 |
+| `CL` | `cl_human_subset.owl` + `cl_mouse_subset.owl` を union | `cl.owl` | subset 生成には `efo.owl` も merge する (EFO の細胞 term を CL subset に取り込むため) |
 | `UBERON` | `uberon_human_subset.owl` + `uberon_mouse_subset.owl` を union | `uberon.owl` | |
-| `MONDO` | `mondo_human_subset.owl` | `mondo.owl` | mouse 用 subset は無く human 用を流用（bsllmner-mk2 ontology.md 記載通り） |
-| `ChEBI` | `chebi_subset.owl` | `chebi.owl` | 140MB / 774MB |
+| `MONDO` | `mondo_human_subset.owl` | `mondo.owl` | mouse 用 subset は無く human 用を流用 |
+| `ChEBI` | `chebi_subset.owl` | `chebi.owl` | 140MB / 774MB。subset 生成に ROBOT Java heap 24 GB 要 |
 
 NCBI Gene は hierarchy が薄いため `ontology.parquet` に含めない（design-memo §6）。
 
