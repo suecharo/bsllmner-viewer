@@ -37,7 +37,7 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         id="chip-atlas-hg38",
         organism="Homo sapiens",
         default_sequence_type=None,
-        input_glob="chip-atlas-hg38/input/bs_entries_hg38.jsonl",
+        input_glob="chip-atlas-hg38/input/bs_entries_*.jsonl",
         result_glob="chip-atlas-hg38/result/select_*.json",
         input_is_wrapped=False,
     ),
@@ -45,7 +45,7 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         id="chip-atlas-mm10",
         organism="Mus musculus",
         default_sequence_type=None,
-        input_glob="chip-atlas-mm10/input/bs_entries_mm10.jsonl",
+        input_glob="chip-atlas-mm10/input/bs_entries_*.jsonl",
         result_glob="chip-atlas-mm10/result/select_*.json",
         input_is_wrapped=False,
     ),
@@ -55,6 +55,14 @@ SOURCE_SYSTEMS: tuple[SourceSystem, ...] = (
         default_sequence_type="RNA-Seq",
         input_glob="rnaseq-human/input/bs_entries_*.jsonl",
         result_glob="rnaseq-human/result/select_rnaseq_*.json",
+        input_is_wrapped=True,
+    ),
+    SourceSystem(
+        id="rnaseq-mouse",
+        organism="Mus musculus",
+        default_sequence_type="RNA-Seq",
+        input_glob="rnaseq-mouse/input/bs_entries_*.jsonl",
+        result_glob="rnaseq-mouse/result/select_rnaseq_*.json",
         input_is_wrapped=True,
     ),
 )
@@ -84,12 +92,19 @@ def iter_run_pairs(
 ) -> Iterator[tuple[list[Path], Path]]:
     """`(対応する input file たち, 1 件の result file)` のペアを yield する。
 
-    - chip-atlas (hg38 / mm10): input 1 / result 1 なので、すべての result に同じ input を紐付ける。
-    - rnaseq-human: filename の `YYYY-MM` で input と result をマッチングする。
+    - chip-atlas (hg38 / mm10): input 1〜N / result 1〜M なので、すべての
+      result に同じ input list を紐付ける。
+    - rnaseq-* (human / mouse): filename の `YYYY-MM` で input と result を
+      マッチングする。merged 範囲ファイル
+      (例: ``bs_entries_2008-01-01_2013-12-31.jsonl`` ↔
+      ``select_rnaseq_mouse_2008-01_2013-12.json``) は regex が両端の
+      ``YYYY-MM`` を別々に拾うため厳密マッチしないが、build-samples は
+      result 由来の accession を base に samples 行を生成するため致命傷では
+      ない (input 由来 column が source_system default に fallback するだけ)。
     """
     results = list(iter_result_files(data_dir, source))
     inputs = list(iter_input_files(data_dir, source))
-    if source.id != "rnaseq-human":
+    if not source.id.startswith("rnaseq-"):
         for r in results:
             yield (inputs, r)
         return

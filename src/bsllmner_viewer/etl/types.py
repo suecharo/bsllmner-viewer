@@ -63,7 +63,9 @@ class RunMetadata(BaseModel):
     total_entries: int | None = None
 
 
-SourceSystemId = Literal["chip-atlas-hg38", "chip-atlas-mm10", "rnaseq-human"]
+SourceSystemId = Literal[
+    "chip-atlas-hg38", "chip-atlas-mm10", "rnaseq-human", "rnaseq-mouse"
+]
 
 
 class BsInputEntry(BaseModel):

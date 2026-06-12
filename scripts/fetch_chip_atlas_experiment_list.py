@@ -17,7 +17,7 @@ import os
 import sys
 from pathlib import Path
 
-from scripts._http_cache import download_with_resume
+from _http_cache import download_with_resume
 
 logger = logging.getLogger("fetch_chip_atlas_experiment_list")
 

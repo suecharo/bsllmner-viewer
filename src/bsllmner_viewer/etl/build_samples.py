@@ -1,3 +1,4 @@
+import datetime
 import logging
 from pathlib import Path
 
@@ -11,6 +12,30 @@ from bsllmner_viewer.etl.sources import SOURCE_SYSTEMS, SourceSystem, iter_run_p
 from bsllmner_viewer.etl.types import BsInputEntry, SourceSystemId
 
 logger = logging.getLogger(__name__)
+
+
+def _publication_year(
+    pub_date: datetime.datetime | None,
+    *,
+    now: datetime.datetime | None = None,
+) -> int | None:
+    """`publication_date` から `submission_year` を導出する。
+
+    NCBI BioSample の ``publication_date`` には embargo 解除予定日が入る
+    ことがあり (例: 2026 年 ETL 時点で ``2027-XX-XX`` の sample が存在)、
+    そのまま採用すると Cohort の ``ORDER BY submission_year DESC`` で未来
+    年が最上位に並ぶ。ETL 実行年より大きい年は ``None`` 扱いとする
+    (docs/data-model.md の ``submission_year`` 列定義参照)。
+
+    ``now`` は test から固定 ETL 実行時刻を注入するための seam。
+    """
+    if pub_date is None:
+        return None
+    current_year = (now or datetime.datetime.now(datetime.UTC)).year
+    year = pub_date.year
+    if year > current_year:
+        return None
+    return year
 
 # SRX-per-BioSample counts live inline on samples.parquet so the Cohort
 # page's main table (1 row = 1 BioSample, "first SRX + N more") needs no
@@ -58,9 +83,7 @@ def _make_row(
         "accession": accession,
         "organism": raw_organism if raw_organism else source.organism,
         "organism_normalized": normalize_organism(raw_organism) or source.organism,
-        "submission_year": (
-            bs.publication_date.year if bs and bs.publication_date else None
-        ),
+        "submission_year": _publication_year(bs.publication_date) if bs else None,
         "project": bs.bioproject if bs else None,
         "title": bs.title if bs else None,
         "source_system": source.id,

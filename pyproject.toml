@@ -73,6 +73,9 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 python_version = "3.12"
 strict = true
 files = ["src", "scripts"]
+# scripts/ は package ではなく sibling import (`from _http_cache import ...`) で書いてあるため、
+# mypy にも scripts/ を import 解決の search path に入れる
+mypy_path = "scripts"
 
 [[tool.mypy.overrides]]
 module = [
